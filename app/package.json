@@ -1,0 +1,25 @@
+{
+  "name": "@mcpaths/app",
+  "version": "0.1.0",
+  "private": true,
+  "license": "GPL-3.0-only",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "electron ."
+  },
+  "dependencies": {
+    "@mcpaths/core": "*",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "electron": "^33.4.0",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.0"
+  }
+}

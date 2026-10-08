@@ -1,0 +1,28 @@
+{
+  "name": "mcpaths",
+  "version": "0.1.0",
+  "private": true,
+  "license": "GPL-3.0-only",
+  "description": "Draw paths into a Minecraft Java world.",
+  "author": "Maruan Biasi El Achkar",
+  "main": "app/electron/main.cjs",
+  "workspaces": ["core", "app"],
+  "scripts": {
+    "build": "npm run build -w core && npm run build -w app",
+    "test": "npm test -w core",
+    "typecheck": "npm run typecheck -w core && npm run typecheck -w app",
+    "start": "npm run build && npm start -w app",
+    "dist:win": "npm run build && electron-builder --win nsis --publish never"
+  },
+  "dependencies": {
+    "minecraft-data": "3.117.0",
+    "prismarine-block": "1.23.0",
+    "prismarine-chunk": "1.41.0",
+    "prismarine-nbt": "2.8.0",
+    "prismarine-provider-anvil": "2.13.0"
+  },
+  "devDependencies": {
+    "electron": "33.4.11",
+    "electron-builder": "26.15.3"
+  }
+}
