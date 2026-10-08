@@ -87,6 +87,13 @@ export interface MapResult {
   warning?: string
 }
 
+export interface OverviewResult {
+  cx: number[]
+  cz: number[]
+  rgb: Uint8Array
+  failed: number
+}
+
 export interface ApiResult<T> { ok: boolean, data?: T, error?: string, cancelled?: boolean }
 
 export interface McPathsApi {
@@ -96,6 +103,7 @@ export interface McPathsApi {
   bounds: (dim: Dimension) => Promise<ApiResult<{ minX: number, minZ: number, maxX: number, maxZ: number } | null>>
   regions: (dim: Dimension) => Promise<ApiResult<RegionMask[]>>
   sample: (query: { dim: Dimension, originX: number, originZ: number, width: number, height: number, force?: boolean }) => Promise<ApiResult<MapResult>>
+  overview: (query: { dim: Dimension, chunks: { cx: number, cz: number }[], force?: boolean }) => Promise<ApiResult<OverviewResult>>
   preview: (query: { dim: Dimension, paths: { name: string, points: XZ[], preset: PresetId, options: PathOptions }[] }) => Promise<ApiResult<{ x: number, z: number, name: string }[]>>
   apply: (query: { dim: Dimension, paths: { name: string, points: XZ[], preset: PresetId, options: PathOptions }[] }) => Promise<ApiResult<{ backupDir: string | null, chunks: number }>>
   onOpened: (handler: (payload: WorldPayload) => void) => () => void

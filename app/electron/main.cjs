@@ -171,6 +171,37 @@ ipcMain.handle('sample', async (event, query) => {
   })
 })
 
+ipcMain.handle('overview', async (event, query) => {
+  const token = ++mapToken
+  if (!world) return { ok: false, error: 'No world is open.' }
+  const chunks = Array.isArray(query?.chunks) ? query.chunks : []
+  return enqueue(async () => {
+    if (!world || token !== mapToken) return { ok: false, cancelled: true }
+    try {
+      if (query.force) world.clearMapCache()
+      const map = await core.sampleOverview(world, query.dim, chunks, {
+        progress: message => {
+          if (token === mapToken) event.sender.send('map-progress', message)
+        },
+        cancelled: () => token !== mapToken
+      })
+      if (token !== mapToken || map.aborted) return { ok: false, cancelled: true }
+      return {
+        ok: true,
+        data: {
+          cx: map.cx,
+          cz: map.cz,
+          rgb: asBytes(map.rgb),
+          failed: map.failed
+        }
+      }
+    } catch (error) {
+      if (token !== mapToken) return { ok: false, cancelled: true }
+      return { ok: false, error: error.message }
+    }
+  })
+})
+
 ipcMain.handle('preview', async (_event, query) => {
   if (!world) return { ok: false, error: 'No world is open.' }
   return enqueue(async () => {

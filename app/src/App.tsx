@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
+import { MAX_PIXELS_PER_BLOCK, MIN_PIXELS_PER_BLOCK, farPixelsPerBlock, sliderToZoom, viewLod, zoomToSlider } from './lod'
 import { paintSwatch } from './swatches'
 import {
   DEFAULT_OPTIONS,
@@ -42,9 +43,7 @@ const GAME_LABEL: Record<string, string> = {
   spectator: 'Spectator'
 }
 
-const CHUNK_BUDGET = 96
-
-type MapPhase = 'loading' | 'ready' | 'empty' | 'error' | 'overview'
+type MapPhase = 'loading' | 'ready' | 'empty' | 'error'
 type MapBitmap = {
   canvas: HTMLCanvasElement
   width: number
@@ -67,6 +66,7 @@ export function App() {
   const [preview, setPreview] = useState<{ x: number, z: number, name: string }[]>([])
   const [busy, setBusy] = useState(false)
   const [zoom, setZoom] = useState(8)
+  const [minZoom, setMinZoom] = useState(MIN_PIXELS_PER_BLOCK)
   const [mapPhase, setMapPhase] = useState<MapPhase>('loading')
   const [mapMessage, setMapMessage] = useState('Indexing regions…')
   const view = useRef({ originX: 0, originZ: 0, scale: 8 })
@@ -74,6 +74,11 @@ export function App() {
   const mapRef = useRef<MapBitmap | null>(null)
   const maskRef = useRef(new Map<string, Uint8Array>())
   const maskListRef = useRef<{ rx: number, rz: number, present: Uint8Array }[]>([])
+  const overviewRef = useRef(new Map<string, Uint8Array>())
+  const spanRef = useRef<{ w: number, h: number } | null>(null)
+  const minZoomRef = useRef(MIN_PIXELS_PER_BLOCK)
+  const overviewNoted = useRef(false)
+  const applyScaleRef = useRef<(next: number) => void>(() => {})
   const drag = useRef<{ mode: 'pan' | 'point', index: number, sx: number, sy: number, ox: number, oz: number } | null>(null)
   const sampleSeq = useRef(0)
   const paintRef = useRef<() => void>(() => {})
@@ -101,6 +106,11 @@ export function App() {
     regionsReady.current = false
     maskRef.current = new Map()
     maskListRef.current = []
+    overviewRef.current = new Map()
+    spanRef.current = null
+    overviewNoted.current = false
+    minZoomRef.current = MIN_PIXELS_PER_BLOCK
+    setMinZoom(MIN_PIXELS_PER_BLOCK)
     mapRef.current = null
     pendingFocus.current = focusOf(payload.info, 'overworld')
     view.current.scale = 8
@@ -180,25 +190,115 @@ export function App() {
       setMapMessage('Preparing the map…')
       return
     }
+    const stage = canvas
+    const opened = current
     if (pendingFocus.current) {
       const focus = pendingFocus.current
       pendingFocus.current = null
       view.current.originX = focus.x - canvas.clientWidth / view.current.scale / 2
       view.current.originZ = focus.z - canvas.clientHeight / view.current.scale / 2
     }
+
+    async function fillOverview(seq: number, passForce: boolean) {
+      if (regionsReady.current && maskRef.current.size === 0) {
+        setMapPhase('empty')
+        setMapMessage(emptyMessage(opened, dim))
+        paintRef.current()
+        return
+      }
+      const occupied = occupiedInView(stage, view.current, maskRef.current)
+      const missing = occupied.filter(chunk => !overviewRef.current.has(overviewKey(dim, chunk.cx, chunk.cz)))
+      if (missing.length === 0) {
+        if (seq !== sampleSeq.current) return
+        if (!regionsReady.current && occupied.length === 0) {
+          setMapPhase('loading')
+          setMapMessage('Indexing regions…')
+        } else {
+          setMapPhase('ready')
+          setMapMessage('')
+        }
+        paintRef.current()
+        return
+      }
+      setMapPhase('loading')
+      setMapMessage('Building overview…')
+      paintRef.current()
+      let live = true
+      const off = window.mcpaths.onMapProgress(message => {
+        if (live && seq === sampleSeq.current) setMapMessage(message)
+      })
+      try {
+        const midCx = (view.current.originX + stage.clientWidth / view.current.scale / 2) / 16
+        const midCz = (view.current.originZ + stage.clientHeight / view.current.scale / 2) / 16
+        missing.sort((a, b) => {
+          const da = (a.cx - midCx) ** 2 + (a.cz - midCz) ** 2
+          const db = (b.cx - midCx) ** 2 + (b.cz - midCz) ** 2
+          return da - db
+        })
+        const total = occupied.length
+        let done = total - missing.length
+        let first = passForce
+        for (let i = 0; i < missing.length; i += 48) {
+          if (seq !== sampleSeq.current || !worldRef.current) return
+          setMapMessage(`Coloring ${done} / ${total} chunks…`)
+          const result = await window.mcpaths.overview({
+            dim,
+            chunks: missing.slice(i, i + 48),
+            force: first
+          })
+          first = false
+          if (seq !== sampleSeq.current || !worldRef.current) return
+          if (result.cancelled) return
+          if (!result.ok || !result.data) {
+            setMapPhase('error')
+            setMapMessage(result.error || 'The overview could not be colored.')
+            note(result.error || 'The overview could not be colored.', true)
+            paintRef.current()
+            return
+          }
+          const cx = numberList(result.data.cx)
+          const cz = numberList(result.data.cz)
+          const rgb = bytesOf(result.data.rgb)
+          const count = Math.min(cx.length, cz.length, Math.floor(rgb.length / 12))
+          for (let n = 0; n < count; n++) {
+            const copy = new Uint8Array(12)
+            copy.set(rgb.subarray(n * 12, n * 12 + 12))
+            overviewRef.current.set(overviewKey(dim, cx[n] ?? 0, cz[n] ?? 0), copy)
+          }
+          done += count
+          paintRef.current()
+          setMapMessage(`Coloring ${Math.min(done, total)} / ${total} chunks…`)
+        }
+        if (seq !== sampleSeq.current) return
+        live = false
+        setMapPhase('ready')
+        setMapMessage('')
+        if (done > 0 && !overviewNoted.current) {
+          overviewNoted.current = true
+          note('Far view uses terrain colors. Zoom in for block detail.')
+        }
+      } catch (error) {
+        if (seq !== sampleSeq.current || !worldRef.current) return
+        const message = error instanceof Error ? error.message : 'The overview could not be colored.'
+        setMapPhase('error')
+        setMapMessage(message)
+        note(message, true)
+        paintRef.current()
+      } finally {
+        off()
+      }
+    }
+
     const seq = ++sampleSeq.current
+    if (force) overviewRef.current.clear()
     const scale = view.current.scale
     const blocksW = Math.ceil(canvas.clientWidth / scale) + 1
     const blocksH = Math.ceil(canvas.clientHeight / scale) + 1
     const across = Math.ceil(canvas.clientWidth / scale / 16)
     const down = Math.ceil(canvas.clientHeight / scale / 16)
-    if (across * down > CHUNK_BUDGET || blocksW > 512 || blocksH > 512) {
-      mapRef.current = null
-      setMapPhase(regionsReady.current && maskRef.current.size === 0 ? 'empty' : 'overview')
-      setMapMessage(regionsReady.current && maskRef.current.size === 0
-        ? emptyMessage(current, dim)
-        : 'Zoom in to color the terrain. Explored chunks stay on the grid.')
+    if (viewLod(across, down) === 'overview') {
       paintRef.current()
+      await fillOverview(seq, force)
       return
     }
     setMapPhase('loading')
@@ -295,7 +395,7 @@ export function App() {
     const scale = view.current.scale
     const originX = view.current.originX
     const originZ = view.current.originZ
-    drawFootprints(ctx, cssW, cssH, originX, originZ, scale, maskRef.current)
+    drawTerrain(ctx, cssW, cssH, originX, originZ, scale, maskRef.current, overviewRef.current, dim)
     const map = mapRef.current
     if (map) {
       ctx.imageSmoothingEnabled = false
@@ -308,7 +408,7 @@ export function App() {
       )
     }
     if (16 * scale >= 8) strokeGrid(ctx, cssW, cssH, originX, originZ, scale, 16, 'rgba(232, 238, 246, 0.16)', 1)
-    if (512 * scale >= 12) strokeGrid(ctx, cssW, cssH, originX, originZ, scale, 512, 'rgba(228, 177, 90, 0.55)', 1)
+    if (512 * scale >= 16) strokeGrid(ctx, cssW, cssH, originX, originZ, scale, 512, 'rgba(232, 238, 246, 0.28)', 1)
     const current = worldRef.current
     if (current && dim === 'overworld') {
       const sx = (current.info.spawn.x + 0.5 - originX) * scale
@@ -347,7 +447,7 @@ export function App() {
     }
     if (visibleRef.current) {
       const visible = countVisible(canvas, view.current, maskRef.current)
-      visibleRef.current.textContent = visible < 0 ? 'zoomed out' : `${visible} chunks in view`
+      visibleRef.current.textContent = `${visible} chunks in view`
     }
   }, [paths, activeId, preview, dim])
 
@@ -363,6 +463,11 @@ export function App() {
       setZoom(scale)
     }
     pendingFocus.current = focusOf(world.info, dim)
+    overviewRef.current = new Map()
+    spanRef.current = null
+    maskRef.current = new Map()
+    maskListRef.current = []
+    regionsReady.current = false
     mapRef.current = null
     recentered.current = false
     if (canvas && canvas.clientWidth >= 8 && pendingFocus.current) {
@@ -398,12 +503,14 @@ export function App() {
       for (const mask of list) index.set(`${mask.rx},${mask.rz}`, mask.present)
       maskRef.current = index
       regionsReady.current = true
+      spanRef.current = exploredSpan(list)
+      refreshMinZoom()
       paintRef.current()
       if (jumpToTerrain()) void sampleRef.current()
-      else if (list.length === 0 && mapRef.current == null) {
+      else if (list.length === 0 && mapRef.current == null && overviewRef.current.size === 0) {
         setMapPhase('empty')
         setMapMessage(emptyMessage(world, dim))
-      }
+      } else if (canvasIsOverview()) void sampleRef.current()
     }).catch((error: unknown) => {
       if (cancel) return
       regionsReady.current = true
@@ -448,6 +555,7 @@ export function App() {
         view.current.originX = focus.x - canvas.clientWidth / view.current.scale / 2
         view.current.originZ = focus.z - canvas.clientHeight / view.current.scale / 2
       }
+      refreshMinZoom()
       paintRef.current()
       scheduleSample()
     })
@@ -462,7 +570,7 @@ export function App() {
       event.preventDefault()
       const rect = canvas.getBoundingClientRect()
       const prev = view.current.scale
-      const next = clampScale(prev * (event.deltaY > 0 ? 0.9 : 1.12))
+      const next = clampScale(prev * (event.deltaY > 0 ? 0.8 : 1.25), minZoomRef.current)
       const px = event.clientX - rect.left
       const py = event.clientY - rect.top
       const blockX = view.current.originX + px / prev
@@ -481,7 +589,7 @@ export function App() {
   function applyScale(next: number) {
     const canvas = canvasRef.current
     const prev = view.current.scale
-    const scale = clampScale(next)
+    const scale = clampScale(next, minZoomRef.current)
     if (canvas) {
       const px = canvas.clientWidth / 2
       const py = canvas.clientHeight / 2
@@ -494,6 +602,32 @@ export function App() {
     setZoom(scale)
     paint()
     scheduleSample()
+  }
+
+  applyScaleRef.current = applyScale
+
+  function refreshMinZoom() {
+    const canvas = canvasRef.current
+    const width = canvas && canvas.clientWidth >= 8 ? canvas.clientWidth : 1000
+    const height = canvas && canvas.clientHeight >= 8 ? canvas.clientHeight : 800
+    const span = spanRef.current
+    const next = span
+      ? farPixelsPerBlock(width, height, span.w, span.h)
+      : farPixelsPerBlock(width, height, 4096, 4096)
+    minZoomRef.current = next
+    setMinZoom(prev => prev === next ? prev : next)
+    if (view.current.scale < next) {
+      view.current.scale = next
+      setZoom(next)
+    }
+  }
+
+  function canvasIsOverview(): boolean {
+    const canvas = canvasRef.current
+    if (!canvas || canvas.clientWidth < 8) return false
+    const across = Math.ceil(canvas.clientWidth / view.current.scale / 16)
+    const down = Math.ceil(canvas.clientHeight / view.current.scale / 16)
+    return viewLod(across, down) === 'overview'
   }
 
   function toBlock(event: { clientX: number, clientY: number }): XZ {
@@ -572,6 +706,12 @@ export function App() {
       if (!worldRef.current) return
       const target = event.target as HTMLElement | null
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT')) return
+      if (event.key === '-' || event.key === '_' || event.key === '=' || event.key === '+') {
+        event.preventDefault()
+        const factor = event.key === '-' || event.key === '_' ? 1 / 1.25 : 1.25
+        applyScaleRef.current(view.current.scale * factor)
+        return
+      }
       if (event.key === 'ArrowLeft' || event.key === 'ArrowRight' || event.key === 'ArrowUp' || event.key === 'ArrowDown') {
         event.preventDefault()
         const step = 80 / view.current.scale
@@ -678,6 +818,8 @@ export function App() {
     sampleSeq.current++
     worldRef.current = null
     mapRef.current = null
+    overviewRef.current = new Map()
+    spanRef.current = null
     setWorld(null)
     note(saves.length ? 'Pick a save, or open a folder.' : 'No saves in the usual folders.')
   }
@@ -708,17 +850,17 @@ export function App() {
             </div>
             <label className="zoom">
               <span>Zoom</span>
-              <button type="button" className="icon" onClick={() => applyScale(zoom / 1.25)} aria-label="Zoom out">−</button>
+              <button type="button" className="icon" onClick={() => applyScale(view.current.scale / 1.25)} aria-label="Zoom out">−</button>
               <input
                 type="range"
-                min={0.5}
-                max={32}
-                step={0.01}
-                value={zoom}
+                min={0}
+                max={1}
+                step={0.001}
+                value={zoomToSlider(zoom, minZoom, MAX_PIXELS_PER_BLOCK)}
                 aria-label="Zoom"
-                onChange={event => applyScale(Number(event.target.value))}
+                onChange={event => applyScale(sliderToZoom(Number(event.target.value), minZoomRef.current, MAX_PIXELS_PER_BLOCK))}
               />
-              <button type="button" className="icon" onClick={() => applyScale(zoom * 1.25)} aria-label="Zoom in">+</button>
+              <button type="button" className="icon" onClick={() => applyScale(view.current.scale * 1.25)} aria-label="Zoom in">+</button>
               <span className="zoom-read">{zoomLabel(zoom)}</span>
             </label>
           </>
@@ -949,16 +1091,21 @@ function emptyMessage(world: WorldPayload, dim: Dimension): string {
 function detailScale(width: number, height: number): number {
   const across = width / (10 * 16)
   const down = height / (8 * 16)
-  return clampScale(Math.max(across, down))
+  return Math.min(MAX_PIXELS_PER_BLOCK, Math.max(2, Math.max(across, down)))
 }
 
-function clampScale(scale: number): number {
-  return Math.min(32, Math.max(0.5, scale))
+function clampScale(scale: number, min: number): number {
+  return Math.min(MAX_PIXELS_PER_BLOCK, Math.max(min, scale))
 }
 
 function zoomLabel(scale: number): string {
-  const rounded = Math.round(scale * 10) / 10
-  return Number.isInteger(rounded) ? `${rounded} px` : `${rounded.toFixed(1)} px`
+  if (scale >= 10) return `${Math.round(scale)} px`
+  if (scale >= 1) {
+    const rounded = Math.round(scale * 10) / 10
+    return Number.isInteger(rounded) ? `${rounded} px` : `${rounded.toFixed(1)} px`
+  }
+  if (scale >= 0.1) return `${scale.toFixed(2)} px`
+  return `${scale.toFixed(3)} px`
 }
 
 function saveDetail(save: SaveListing): string {
@@ -1058,7 +1205,6 @@ function countVisible(
   masks: Map<string, Uint8Array>
 ): number {
   const bounds = viewChunkBounds(canvas, view)
-  if ((bounds.r1x - bounds.r0x + 1) * (bounds.r1z - bounds.r0z + 1) > 48) return -1
   let count = 0
   for (let rz = bounds.r0z; rz <= bounds.r1z; rz++) {
     for (let rx = bounds.r0x; rx <= bounds.r1x; rx++) {
@@ -1114,14 +1260,90 @@ function nearestChunk(masks: { rx: number, rz: number, present: Uint8Array }[], 
   return best
 }
 
-function drawFootprints(
+function overviewKey(dim: string, cx: number, cz: number): string {
+  return `${dim}:${cx},${cz}`
+}
+
+function numberList(value: unknown): number[] {
+  if (Array.isArray(value)) return value.map(item => Number(item))
+  if (ArrayBuffer.isView(value) && !(value instanceof DataView)) return Array.from(value as unknown as ArrayLike<number>)
+  return []
+}
+
+function exploredSpan(list: { rx: number, rz: number, present: Uint8Array }[]): { w: number, h: number } | null {
+  let minCX = Infinity
+  let maxCX = -Infinity
+  let minCZ = Infinity
+  let maxCZ = -Infinity
+  let any = false
+  for (const mask of list) {
+    for (let i = 0; i < 1024; i++) {
+      if (!bitSet(mask.present, i)) continue
+      any = true
+      const cx = mask.rx * 32 + (i & 31)
+      const cz = mask.rz * 32 + (i >> 5)
+      if (cx < minCX) minCX = cx
+      if (cx > maxCX) maxCX = cx
+      if (cz < minCZ) minCZ = cz
+      if (cz > maxCZ) maxCZ = cz
+    }
+  }
+  if (!any) return null
+  return { w: (maxCX - minCX + 1) * 16, h: (maxCZ - minCZ + 1) * 16 }
+}
+
+function occupiedInView(
+  canvas: HTMLCanvasElement,
+  view: { originX: number, originZ: number, scale: number },
+  masks: Map<string, Uint8Array>
+): { cx: number, cz: number }[] {
+  const bounds = viewChunkBounds(canvas, view)
+  const chunks: { cx: number, cz: number }[] = []
+  for (let rz = bounds.r0z; rz <= bounds.r1z; rz++) {
+    for (let rx = bounds.r0x; rx <= bounds.r1x; rx++) {
+      const present = masks.get(`${rx},${rz}`)
+      if (!present) continue
+      const lx0 = Math.max(0, bounds.c0x - rx * 32)
+      const lx1 = Math.min(31, bounds.c1x - rx * 32)
+      const lz0 = Math.max(0, bounds.c0z - rz * 32)
+      const lz1 = Math.min(31, bounds.c1z - rz * 32)
+      for (let lz = lz0; lz <= lz1; lz++) {
+        for (let lx = lx0; lx <= lx1; lx++) {
+          if (bitSet(present, (lz << 5) | lx)) chunks.push({ cx: rx * 32 + lx, cz: rz * 32 + lz })
+        }
+      }
+    }
+  }
+  return chunks
+}
+
+function cssAt(tex: Uint8Array, quad: number): string {
+  const i = quad * 3
+  return `rgb(${tex[i] ?? 0},${tex[i + 1] ?? 0},${tex[i + 2] ?? 0})`
+}
+
+function averageCss(tex: Uint8Array): string {
+  let r = 0
+  let g = 0
+  let b = 0
+  for (let i = 0; i < 12; i += 3) {
+    r += tex[i] ?? 0
+    g += tex[i + 1] ?? 0
+    b += tex[i + 2] ?? 0
+  }
+  return `rgb(${r >> 2},${g >> 2},${b >> 2})`
+}
+
+function drawTerrain(
   ctx: CanvasRenderingContext2D,
   cssW: number,
   cssH: number,
   originX: number,
   originZ: number,
   scale: number,
-  masks: Map<string, Uint8Array>
+  masks: Map<string, Uint8Array>,
+  colors: Map<string, Uint8Array>,
+  dim: string
 ) {
   if (masks.size === 0) return
   const maxX = originX + cssW / scale
@@ -1130,35 +1352,49 @@ function drawFootprints(
   const c1x = Math.floor(maxX / 16)
   const c0z = Math.floor(originZ / 16)
   const c1z = Math.floor(maxZ / 16)
-  const span = (c1x - c0x + 1) * (c1z - c0z + 1)
-  ctx.fillStyle = '#24382f'
-  if (span > 4000 || 16 * scale < 2) {
-    const r0x = Math.floor(c0x / 32)
-    const r1x = Math.floor(c1x / 32)
-    const r0z = Math.floor(c0z / 32)
-    const r1z = Math.floor(c1z / 32)
-    for (let rz = r0z; rz <= r1z; rz++) {
-      for (let rx = r0x; rx <= r1x; rx++) {
-        if (!masks.has(`${rx},${rz}`)) continue
-        const sx = (rx * 512 - originX) * scale
-        const sz = (rz * 512 - originZ) * scale
-        ctx.fillRect(sx, sz, 512 * scale, 512 * scale)
-      }
-    }
-    return
-  }
-  for (let cz = c0z; cz <= c1z; cz++) {
-    for (let cx = c0x; cx <= c1x; cx++) {
-      const rx = Math.floor(cx / 32)
-      const rz = Math.floor(cz / 32)
+  const r0x = Math.floor(c0x / 32)
+  const r1x = Math.floor(c1x / 32)
+  const r0z = Math.floor(c0z / 32)
+  const r1z = Math.floor(c1z / 32)
+  const chunkPx = 16 * scale
+  const fine = chunkPx >= 3
+  for (let rz = r0z; rz <= r1z; rz++) {
+    for (let rx = r0x; rx <= r1x; rx++) {
       const present = masks.get(`${rx},${rz}`)
       if (!present) continue
-      let lx = cx % 32
-      let lz = cz % 32
-      if (lx < 0) lx += 32
-      if (lz < 0) lz += 32
-      if (!bitSet(present, (lz << 5) | lx)) continue
-      ctx.fillRect((cx * 16 - originX) * scale, (cz * 16 - originZ) * scale, 16 * scale, 16 * scale)
+      const lx0 = Math.max(0, c0x - rx * 32)
+      const lx1 = Math.min(31, c1x - rx * 32)
+      const lz0 = Math.max(0, c0z - rz * 32)
+      const lz1 = Math.min(31, c1z - rz * 32)
+      for (let lz = lz0; lz <= lz1; lz++) {
+        for (let lx = lx0; lx <= lx1; lx++) {
+          if (!bitSet(present, (lz << 5) | lx)) continue
+          const cx = rx * 32 + lx
+          const cz = rz * 32 + lz
+          const sx = (cx * 16 - originX) * scale
+          const sz = (cz * 16 - originZ) * scale
+          const tex = colors.get(overviewKey(dim, cx, cz))
+          if (!tex || tex.length < 12) {
+            ctx.fillStyle = '#24382f'
+            ctx.fillRect(sx, sz, Math.max(chunkPx, 1), Math.max(chunkPx, 1))
+            continue
+          }
+          if (!fine) {
+            ctx.fillStyle = averageCss(tex)
+            ctx.fillRect(sx, sz, Math.max(chunkPx, 1), Math.max(chunkPx, 1))
+            continue
+          }
+          const half = chunkPx / 2
+          ctx.fillStyle = cssAt(tex, 0)
+          ctx.fillRect(sx, sz, half, half)
+          ctx.fillStyle = cssAt(tex, 1)
+          ctx.fillRect(sx + half, sz, half, half)
+          ctx.fillStyle = cssAt(tex, 2)
+          ctx.fillRect(sx, sz + half, half, half)
+          ctx.fillStyle = cssAt(tex, 3)
+          ctx.fillRect(sx + half, sz + half, half, half)
+        }
+      }
     }
   }
 }

@@ -1,6 +1,7 @@
 import { colorFor, isAir, isMapDecoration } from './blocks'
 import { describeState } from './codec'
 import { regionOf } from './grid'
+import { DETAIL_CHUNK_BUDGET } from './lod'
 import type { Dimension } from './versions'
 import type { LoadHooks, World } from './world'
 
@@ -20,8 +21,7 @@ export interface MapSample {
   aborted?: boolean
 }
 
-const CHUNK_BUDGET = 96
-const MAX_EDGE = 512
+const MAX_EDGE = 2048
 
 const paintCache = new Map<number, [number, number, number] | 0 | 1>()
 
@@ -50,43 +50,41 @@ function shade(color: [number, number, number], y: number): [number, number, num
   ]
 }
 
+const VOID_COLOR: [number, number, number] = [20, 24, 32]
+
+/** Surface color of one column. Walks section palettes / state ids. Skips air and plants. */
+function columnColor(column: any, lx: number, lz: number): [number, number, number] {
+  const sections = (column.sections ?? []) as any[]
+  const minY = (column.minY ?? 0) as number
+  for (let index = sections.length - 1; index >= 0; index--) {
+    const section = sections[index]
+    if (!section) continue
+    if (typeof section.isEmpty === 'function' ? section.isEmpty() : section.solidBlockCount === 0) continue
+    const data = section.data
+    const y0 = minY + index * 16
+    if (data && typeof data.value === 'number' && data.palette == null) {
+      const paint = paintOf(data.value)
+      if (paint === 0 || paint === 1) continue
+      return shade(paint, y0 + 15)
+    }
+    for (let ly = 15; ly >= 0; ly--) {
+      const stateId = typeof section.get === 'function'
+        ? section.get({ x: lx, y: ly, z: lz })
+        : column.getBlockStateId({ x: lx, y: y0 + ly, z: lz })
+      const paint = paintOf(stateId)
+      if (paint === 0 || paint === 1) continue
+      return shade(paint, y0 + ly)
+    }
+  }
+  return VOID_COLOR
+}
+
 /** Top-down colors for one chunk. Decoration blocks are skipped so the ground shows. */
 export function renderSurface(column: any): Uint8Array {
   const rgb = new Uint8Array(16 * 16 * 3)
-  const sections = (column.sections ?? []) as any[]
-  const minY = (column.minY ?? 0) as number
   for (let lz = 0; lz < 16; lz++) {
     for (let lx = 0; lx < 16; lx++) {
-      let color: [number, number, number] | null = null
-      let topY = minY
-      for (let index = sections.length - 1; index >= 0; index--) {
-        const section = sections[index]
-        if (!section) continue
-        if (typeof section.isEmpty === 'function' ? section.isEmpty() : section.solidBlockCount === 0) continue
-        const data = section.data
-        const y0 = minY + index * 16
-        if (data && typeof data.value === 'number' && data.palette == null) {
-          const paint = paintOf(data.value)
-          if (paint === 0 || paint === 1) continue
-          color = paint
-          topY = y0 + 15
-          break
-        }
-        let found = false
-        for (let ly = 15; ly >= 0; ly--) {
-          const stateId = typeof section.get === 'function'
-            ? section.get({ x: lx, y: ly, z: lz })
-            : column.getBlockStateId({ x: lx, y: y0 + ly, z: lz })
-          const paint = paintOf(stateId)
-          if (paint === 0 || paint === 1) continue
-          color = paint
-          topY = y0 + ly
-          found = true
-          break
-        }
-        if (found) break
-      }
-      const out = color ? shade(color, topY) : [20, 24, 32]
+      const out = columnColor(column, lx, lz)
       const i = (lz * 16 + lx) * 3
       rgb[i] = out[0]
       rgb[i + 1] = out[1]
@@ -94,6 +92,51 @@ export function renderSurface(column: any): Uint8Array {
     }
   }
   return rgb
+}
+
+/** Four columns per chunk: center of each 8×8 quadrant. 12 RGB bytes. */
+export const OVERVIEW_COLUMNS: readonly [number, number][] = [[4, 4], [12, 4], [4, 12], [12, 12]]
+
+export interface OverviewSample {
+  cx: number[]
+  cz: number[]
+  rgb: Uint8Array
+  failed: number
+  aborted?: boolean
+}
+
+export function overviewFromSurface(tile: Uint8Array): Uint8Array {
+  const out = new Uint8Array(OVERVIEW_COLUMNS.length * 3)
+  let n = 0
+  for (const [lx, lz] of OVERVIEW_COLUMNS) {
+    const i = (lz * 16 + lx) * 3
+    out[n++] = tile[i] ?? 0
+    out[n++] = tile[i + 1] ?? 0
+    out[n++] = tile[i + 2] ?? 0
+  }
+  return out
+}
+
+export function overviewTexels(column: any): Uint8Array {
+  const out = new Uint8Array(OVERVIEW_COLUMNS.length * 3)
+  let n = 0
+  for (const [lx, lz] of OVERVIEW_COLUMNS) {
+    const color = columnColor(column, lx, lz)
+    out[n++] = color[0]
+    out[n++] = color[1]
+    out[n++] = color[2]
+  }
+  return out
+}
+
+function solidTex(r: number, g: number, b: number): Uint8Array {
+  const out = new Uint8Array(OVERVIEW_COLUMNS.length * 3)
+  for (let i = 0; i < out.length; i += 3) {
+    out[i] = r
+    out[i + 1] = g
+    out[i + 2] = b
+  }
+  return out
 }
 
 export async function sampleMap(
@@ -109,7 +152,7 @@ export async function sampleMap(
     throw new Error('The map view is not a valid block rectangle.')
   }
   if (width < 1 || height < 1 || width > MAX_EDGE || height > MAX_EDGE) {
-    throw new Error(`Map view is ${width}×${height} blocks. Zoom in so each sample stays within ${MAX_EDGE}.`)
+    throw new Error(`Map view is ${width}×${height} blocks, past the detail sampler limit of ${MAX_EDGE}.`)
   }
   const rgb = new Uint8Array(width * height * 3)
   const present = new Uint8Array(width * height)
@@ -129,8 +172,8 @@ export async function sampleMap(
     }
   }
   wanted.sort((a, b) => a.dist - b.dist)
-  const truncated = wanted.length > CHUNK_BUDGET
-  const chosen = wanted.slice(0, CHUNK_BUDGET)
+  const truncated = wanted.length > DETAIL_CHUNK_BUDGET
+  const chosen = wanted.slice(0, DETAIL_CHUNK_BUDGET)
   chosen.sort((a, b) => a.rx - b.rx || a.rz - b.rz || a.cx - b.cx || a.cz - b.cz)
   const chosenKeys = new Set(chosen.map(chunk => `${chunk.cx},${chunk.cz}`))
   await world.preloadChunks(dim, chosen, hooks)
@@ -190,6 +233,67 @@ export async function sampleMap(
   }
   let warning: string | undefined
   if (failed > 0) warning = `${failed} chunk${failed === 1 ? '' : 's'} could not be read. ${firstError}`
-  else if (truncated) warning = `Colored ${chosen.length} of ${wanted.length} chunks in view. Zoom in for the rest.`
   return { originX, originZ, width, height, rgb, present, chunks, failed, truncated, warning, aborted: false }
+}
+
+/** Sparse terrain colors for a far view. Four columns per chunk, cached on the world. One bad chunk stays red. */
+export async function sampleOverview(
+  world: World,
+  dim: Dimension,
+  chunks: { cx: number, cz: number }[],
+  hooks?: LoadHooks
+): Promise<OverviewSample> {
+  const ordered = chunks.slice().sort((a, b) => {
+    const ar = regionOf(a.cx, a.cz)
+    const br = regionOf(b.cx, b.cz)
+    return ar.rx - br.rx || ar.rz - br.rz || a.cx - b.cx || a.cz - b.cz
+  })
+  const missing: { cx: number, cz: number }[] = []
+  for (const chunk of ordered) {
+    if (world.cachedOverview(dim, chunk.cx, chunk.cz)) continue
+    if (world.chunkError(dim, chunk.cx, chunk.cz)) continue
+    if (world.cachedSurface(dim, chunk.cx, chunk.cz)) continue
+    if (world.columnOf(dim, chunk.cx, chunk.cz)) continue
+    missing.push(chunk)
+  }
+  if (missing.length) {
+    hooks?.progress?.('Building overview…')
+    await world.preloadChunks(dim, missing, hooks)
+  }
+  if (hooks?.cancelled?.()) {
+    return { cx: [], cz: [], rgb: new Uint8Array(), failed: 0, aborted: true }
+  }
+  const cx: number[] = []
+  const cz: number[] = []
+  const rgb = new Uint8Array(ordered.length * OVERVIEW_COLUMNS.length * 3)
+  let failed = 0
+  let colored = 0
+  for (const chunk of ordered) {
+    if (hooks?.cancelled?.()) {
+      return { cx, cz, rgb: rgb.subarray(0, cx.length * 12), failed, aborted: true }
+    }
+    let tex = world.cachedOverview(dim, chunk.cx, chunk.cz)
+    if (!tex) {
+      const error = world.chunkError(dim, chunk.cx, chunk.cz)
+      if (error) {
+        failed++
+        tex = solidTex(140, 72, 72)
+      } else {
+        const surface = world.cachedSurface(dim, chunk.cx, chunk.cz)
+        if (surface) tex = overviewFromSurface(surface)
+        else {
+          const column = world.columnOf(dim, chunk.cx, chunk.cz)
+          tex = column ? overviewTexels(column) : solidTex(VOID_COLOR[0], VOID_COLOR[1], VOID_COLOR[2])
+        }
+      }
+      world.cacheOverview(dim, chunk.cx, chunk.cz, tex)
+    }
+    const offset = cx.length * 12
+    cx.push(chunk.cx)
+    cz.push(chunk.cz)
+    rgb.set(tex, offset)
+    colored++
+    if (colored % 24 === 0) hooks?.progress?.(`Coloring ${colored} chunks…`)
+  }
+  return { cx, cz, rgb: rgb.subarray(0, cx.length * 12), failed, aborted: false }
 }
