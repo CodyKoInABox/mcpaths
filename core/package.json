@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsc -p tsconfig.json --noEmit && node --import tsx --test test/roundtrip.test.ts test/path.test.ts test/versions.test.ts"
+    "test": "tsc -p tsconfig.json --noEmit && node --import tsx --test test/roundtrip.test.ts test/path.test.ts test/versions.test.ts test/names.test.ts test/worldname.test.ts"
   },
   "dependencies": {
     "minecraft-data": "3.117.0",

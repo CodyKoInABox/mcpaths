@@ -24,30 +24,83 @@ export interface SurveyPath {
   draft: boolean
 }
 
+export type GameTypeName = 'survival' | 'creative' | 'adventure' | 'spectator'
+
+export interface PlayerView {
+  x: number
+  y: number
+  z: number
+  dimension: Dimension
+}
+
+export interface SaveRoot {
+  path: string
+  exists: boolean
+}
+
+export interface SaveListing {
+  path: string
+  name: string
+  folder: string
+  dataVersion: number | null
+  versionName: string | null
+  label: string | null
+  spawn: { x: number, y: number, z: number } | null
+  player: PlayerView | null
+  lastPlayed: number | null
+  gameType: GameTypeName | null
+  error: string | null
+}
+
 export interface WorldPayload {
   info: {
     path: string
     name: string
+    folder: string
     dataVersion: number
     versionName: string
     support: { label: string, palette: string }
     spawn: { x: number, y: number, z: number }
+    player: PlayerView | null
+    lastPlayed: number | null
+    gameType: GameTypeName | null
   }
   dimensions: { id: Dimension, region: string, hasFiles: boolean }[]
 }
 
-export interface ApiResult<T> { ok: boolean, data?: T, error?: string }
+export interface RegionMask {
+  rx: number
+  rz: number
+  present: Uint8Array
+}
+
+export interface MapResult {
+  rgb: Uint8Array
+  present: Uint8Array
+  width: number
+  height: number
+  originX: number
+  originZ: number
+  chunks: number
+  failed: number
+  truncated: boolean
+  warning?: string
+}
+
+export interface ApiResult<T> { ok: boolean, data?: T, error?: string, cancelled?: boolean }
 
 export interface McPathsApi {
-  listSaves: () => Promise<ApiResult<WorldPayload['info'][]>>
+  listSaves: () => Promise<ApiResult<{ roots: SaveRoot[], saves: SaveListing[] }>>
   pickFolder: () => Promise<ApiResult<WorldPayload | null>>
   openWorld: (folder: string) => Promise<ApiResult<WorldPayload>>
   bounds: (dim: Dimension) => Promise<ApiResult<{ minX: number, minZ: number, maxX: number, maxZ: number } | null>>
-  sample: (query: { dim: Dimension, originX: number, originZ: number, width: number, height: number }) => Promise<ApiResult<{ rgb: number[], width: number, height: number, originX: number, originZ: number }>>
+  regions: (dim: Dimension) => Promise<ApiResult<RegionMask[]>>
+  sample: (query: { dim: Dimension, originX: number, originZ: number, width: number, height: number, force?: boolean }) => Promise<ApiResult<MapResult>>
   preview: (query: { dim: Dimension, paths: { name: string, points: XZ[], preset: PresetId, options: PathOptions }[] }) => Promise<ApiResult<{ x: number, z: number, name: string }[]>>
   apply: (query: { dim: Dimension, paths: { name: string, points: XZ[], preset: PresetId, options: PathOptions }[] }) => Promise<ApiResult<{ backupDir: string | null, chunks: number }>>
   onOpened: (handler: (payload: WorldPayload) => void) => () => void
   onStatus: (handler: (message: string) => void) => () => void
+  onMapProgress: (handler: (message: string) => void) => () => void
 }
 
 declare global {

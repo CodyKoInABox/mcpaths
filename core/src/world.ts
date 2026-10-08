@@ -20,16 +20,36 @@ import {
 } from './codec'
 import { isAir, isProtectedName } from './blocks'
 import { registry } from './codec'
+import { regionOf } from './grid'
+import {
+  gameTypeFromLevel,
+  lastPlayedFromLevel,
+  levelDisplayName,
+  playerFromLevel,
+  type GameTypeName,
+  type PlayerView
+} from './names'
 
 const RegionFile = require('prismarine-provider-anvil/src/region')
 
 export interface WorldInfo {
   path: string
   name: string
+  folder: string
   dataVersion: number
   versionName: string
   support: VersionSupport
   spawn: { x: number, y: number, z: number }
+  player: PlayerView | null
+  lastPlayed: number | null
+  gameType: GameTypeName | null
+}
+
+export interface RegionMask {
+  rx: number
+  rz: number
+  /** 1024 chunk bits, index `(localZ << 5) | localX`, little-endian bits. */
+  present: Buffer
 }
 
 export interface BlockState {
@@ -54,35 +74,71 @@ interface EditableChunk {
   entities: any[]
 }
 
+function directoryHasRegions(dir: string): boolean {
+  if (!fs.existsSync(dir)) return false
+  try {
+    return fs.readdirSync(dir).some(name => name.endsWith('.mca'))
+  } catch {
+    return false
+  }
+}
+
+/** Chunks present in region headers. Empty directories are ignored. */
+export function regionMasks(worldPath: string, dim: Dimension, dataVersion: number): RegionMask[] {
+  const dir = regionDirectory(worldPath, dim, dataVersion)
+  if (!fs.existsSync(dir)) return []
+  let names: string[]
+  try {
+    names = fs.readdirSync(dir)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(`Could not read region folder ${dir}: ${message}`)
+  }
+  const masks: RegionMask[] = []
+  const header = Buffer.alloc(4096)
+  for (const name of names) {
+    const match = /^r\.(-?\d+)\.(-?\d+)\.mca$/.exec(name)
+    if (!match) continue
+    const present = Buffer.alloc(128)
+    let fd: number
+    try {
+      fd = fs.openSync(path.join(dir, name), 'r')
+    } catch {
+      continue
+    }
+    try {
+      const read = fs.readSync(fd, header, 0, 4096, 0)
+      const slots = Math.min(1024, Math.floor(read / 4))
+      let any = false
+      for (let i = 0; i < slots; i++) {
+        if ((header.readUInt32BE(i * 4) >>> 8) === 0) continue
+        present[i >> 3] |= 1 << (i & 7)
+        any = true
+      }
+      if (any) masks.push({ rx: Number(match[1]), rz: Number(match[2]), present })
+    } finally {
+      fs.closeSync(fd)
+    }
+  }
+  return masks
+}
+
 /** Block bounds of chunks that actually exist in the region headers. */
 export function occupiedBounds(worldPath: string, dim: Dimension, dataVersion: number): { minX: number, minZ: number, maxX: number, maxZ: number } | null {
-  const dir = regionDirectory(worldPath, dim, dataVersion)
-  if (!fs.existsSync(dir)) return null
+  const masks = regionMasks(worldPath, dim, dataVersion)
   let minCX = Infinity
   let minCZ = Infinity
   let maxCX = -Infinity
   let maxCZ = -Infinity
-  const header = Buffer.alloc(4096)
-  for (const name of fs.readdirSync(dir)) {
-    const match = /^r\.(-?\d+)\.(-?\d+)\.mca$/.exec(name)
-    if (!match) continue
-    const rx = Number(match[1])
-    const rz = Number(match[2])
-    const fd = fs.openSync(path.join(dir, name), 'r')
-    try {
-      const read = fs.readSync(fd, header, 0, 4096, 0)
-      const slots = Math.min(1024, Math.floor(read / 4))
-      for (let i = 0; i < slots; i++) {
-        if ((header.readUInt32BE(i * 4) >>> 8) === 0) continue
-        const cx = rx * 32 + (i & 31)
-        const cz = rz * 32 + (i >> 5)
-        if (cx < minCX) minCX = cx
-        if (cz < minCZ) minCZ = cz
-        if (cx > maxCX) maxCX = cx
-        if (cz > maxCZ) maxCZ = cz
-      }
-    } finally {
-      fs.closeSync(fd)
+  for (const mask of masks) {
+    for (let i = 0; i < 1024; i++) {
+      if ((mask.present[i >> 3] & (1 << (i & 7))) === 0) continue
+      const cx = mask.rx * 32 + (i & 31)
+      const cz = mask.rz * 32 + (i >> 5)
+      if (cx < minCX) minCX = cx
+      if (cz < minCZ) minCZ = cz
+      if (cx > maxCX) maxCX = cx
+      if (cz > maxCZ) maxCZ = cz
     }
   }
   if (!Number.isFinite(minCX)) return null
@@ -102,14 +158,14 @@ export function regionDirectory(worldPath: string, dim: Dimension, dataVersion: 
   }
   const modernPath = path.join(worldPath, modern[dim])
   const legacyPath = path.join(worldPath, legacy[dim])
-  const modernHas = fs.existsSync(modernPath)
-  const legacyHas = fs.existsSync(legacyPath)
-  if (dataVersion >= 4786) {
-    if (modernHas || !legacyHas) return modernPath
-    return legacyPath
-  }
-  if (legacyHas || !modernHas) return legacyPath
-  return modernPath
+  // Directory existence is not enough: an empty leftover `region/` would hide
+  // `dimensions/minecraft/.../region`, and the map would sample nothing.
+  const modernHas = directoryHasRegions(modernPath)
+  const legacyHas = directoryHasRegions(legacyPath)
+  if (modernHas && !legacyHas) return modernPath
+  if (legacyHas && !modernHas) return legacyPath
+  if (modernHas && legacyHas) return dataVersion >= 4786 ? modernPath : legacyPath
+  return dataVersion >= 4786 ? modernPath : legacyPath
 }
 
 export async function readWorldInfo(worldPath: string): Promise<WorldInfo> {
@@ -123,22 +179,39 @@ export async function readWorldInfo(worldPath: string): Promise<WorldInfo> {
   } catch {
     throw new Error('level.dat is there, but MC Paths could not read it.')
   }
-  const data = nbt.simplify(parsed.parsed)?.Data
-  if (!data || typeof data.DataVersion !== 'number') {
+  const root = nbt.simplify(parsed.parsed)
+  const data = root?.Data ?? root
+  const dataVersion = typeof data?.DataVersion === 'number' ? data.DataVersion : null
+  if (dataVersion == null) {
     throw new Error('level.dat has no DataVersion, so MC Paths cannot tell how this world stores chunks.')
   }
-  const support = supportForDataVersion(data.DataVersion)
+  const folder = path.basename(worldPath)
+  const name = levelDisplayName(data?.LevelName, folder)
+  let support: VersionSupport
+  try {
+    support = supportForDataVersion(dataVersion)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    const wrapped = new Error(message) as Error & { saveName?: string }
+    wrapped.saveName = name
+    throw wrapped
+  }
+  const versionName = typeof data.Version?.Name === 'string' && data.Version.Name ? data.Version.Name : support.label
   return {
     path: worldPath,
-    name: typeof data.LevelName === 'string' && data.LevelName ? data.LevelName : path.basename(worldPath),
-    dataVersion: data.DataVersion,
-    versionName: data.Version?.Name || support.label,
+    name,
+    folder,
+    dataVersion,
+    versionName,
     support,
     spawn: {
       x: Number(data.SpawnX ?? 0),
       y: Number(data.SpawnY ?? 64),
       z: Number(data.SpawnZ ?? 0)
-    }
+    },
+    player: playerFromLevel(data),
+    lastPlayed: lastPlayedFromLevel(data),
+    gameType: gameTypeFromLevel(data)
   }
 }
 
@@ -175,20 +248,17 @@ function splitBlock(x: number, z: number) {
   return { cx, cz, lx: x - cx * 16, lz: z - cz * 16 }
 }
 
-function regionOf(cx: number, cz: number) {
-  const rx = Math.floor(cx / 32)
-  const rz = Math.floor(cz / 32)
-  let lx = cx % 32
-  let lz = cz % 32
-  if (lx < 0) lx += 32
-  if (lz < 0) lz += 32
-  return { rx, rz, lx, lz }
+export interface LoadHooks {
+  progress?: (message: string) => void
+  cancelled?: () => boolean
 }
 
 export class World {
   readonly info: WorldInfo
   private regions = new Map<string, any>()
   private chunks = new Map<string, EditableChunk>()
+  private surfaces = new Map<string, Uint8Array>()
+  private failures = new Map<string, string>()
 
   private constructor(info: WorldInfo) {
     this.info = info
@@ -210,6 +280,50 @@ export class World {
     for (const region of this.regions.values()) await region.close()
     this.regions.clear()
     this.chunks.clear()
+    this.surfaces.clear()
+    this.failures.clear()
+  }
+
+  clearMapCache() {
+    this.surfaces.clear()
+    this.failures.clear()
+  }
+
+  columnOf(dim: Dimension, cx: number, cz: number): any | null {
+    return this.chunks.get(chunkKey(dim, cx, cz))?.column ?? null
+  }
+
+  cachedSurface(dim: Dimension, cx: number, cz: number): Uint8Array | null {
+    return this.surfaces.get(chunkKey(dim, cx, cz)) ?? null
+  }
+
+  cacheSurface(dim: Dimension, cx: number, cz: number, rgb: Uint8Array) {
+    this.surfaces.set(chunkKey(dim, cx, cz), rgb)
+  }
+
+  chunkError(dim: Dimension, cx: number, cz: number): string | null {
+    return this.failures.get(chunkKey(dim, cx, cz)) ?? null
+  }
+
+  async preloadChunks(dim: Dimension, chunks: { cx: number, cz: number }[], hooks?: LoadHooks) {
+    let lastFile = ''
+    for (const chunk of chunks) {
+      if (hooks?.cancelled?.()) return
+      const { rx, rz } = regionOf(chunk.cx, chunk.cz)
+      const label = `r.${rx}.${rz}.mca`
+      const file = path.join(this.regionDir(dim), label)
+      if (label !== lastFile && fs.existsSync(file)) {
+        hooks?.progress?.(`Reading region ${label}…`)
+        lastFile = label
+      }
+      try {
+        await this.loadChunk(dim, chunk.cx, chunk.cz, false)
+        this.failures.delete(chunkKey(dim, chunk.cx, chunk.cz))
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        this.failures.set(chunkKey(dim, chunk.cx, chunk.cz), message)
+      }
+    }
   }
 
   private async region(file: string) {
@@ -332,6 +446,7 @@ export class World {
     chunk.column.setBlock({ x: lx, y, z: lz }, { stateId })
     chunk.dirty = true
     chunk.touched.add(Math.floor(y / 16))
+    this.surfaces.delete(chunkKey(dim, cx, cz))
   }
 
   setBiome(dim: Dimension, x: number, y: number, z: number, biome: string) {

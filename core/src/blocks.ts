@@ -145,6 +145,13 @@ export function isHeadroom(name: string): boolean {
   return false
 }
 
+/** Plants the top-down map should look through. Snow stays visible. */
+export function isMapDecoration(name: string): boolean {
+  if (!isHeadroom(name)) return false
+  const bare = bareName(name)
+  return bare !== 'snow' && bare !== 'snow_layer'
+}
+
 export function isAir(name: string): boolean {
   const bare = name.replace(/^minecraft:/, '')
   return bare === 'air' || bare === 'cave_air' || bare === 'void_air'
