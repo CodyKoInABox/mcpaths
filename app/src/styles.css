@@ -235,6 +235,10 @@ input.text:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px
 .field { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; }
 .choice { display: flex; flex-wrap: wrap; gap: 4px; }
 .choice button { color: var(--text); background: var(--panel-2); }
+.designs { display: flex; flex-direction: column; gap: 4px; }
+.designs button { text-align: left; }
+.designs button strong { display: block; font-weight: 650; }
+.designs button span { display: block; color: var(--muted); font-size: 12px; line-height: 1.35; }
 
 .browser {
   flex: 1 1 auto;

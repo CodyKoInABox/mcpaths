@@ -1,6 +1,9 @@
 import { isAir, isHeadroom, isLeaves, isLog, isWater } from '../blocks'
+import { placeBridge } from './bridge'
 import { hash01, wanderedRadius } from './noise'
 import {
+  bridgeDesign,
+  normalizeOptions,
   resolveMaterials,
   widthBlocks,
   type Materials,
@@ -75,7 +78,7 @@ export async function planPaths(
       if (path.points.length < 2) continue
       const samples = resample(path.points)
       if (samples.length === 0) continue
-      const options = path.options
+      const options = normalizeOptions(path.options)
       const radius = (widthBlocks(options.width) - 1) / 2
       const sx = Math.round(samples[0].x)
       const sz = Math.round(samples[0].z)
@@ -130,6 +133,7 @@ async function follow(
   cancel: Cancel
 ) {
   const stamps = new Map<string, Stamp>()
+  const wet: { stamp: Stamp, waterY: number }[] = []
   for (let index = 0; index < samples.length; index++) {
     await pause(cancel)
     const sample = samples[index]
@@ -154,7 +158,10 @@ async function follow(
       if (view.protected(x, z)) continue
       const dist = Math.abs(offset)
       const role = dist === 0 ? 'center' : dist >= radius ? 'outer' : 'edge'
-      if (preset === 'trail' && role === 'outer' && hash01(x, z + 41) < 0.38) continue
+      if (preset === 'trail' && role === 'outer' && hash01(x, z + 41) < 0.38) {
+        const under = ground(view, x, z, bounds)
+        if (!under || !isWater(under.name)) continue
+      }
       const key = `${x},${z}`
       const prev = stamps.get(key)
       if (prev && ROLE[prev.role] >= ROLE[role]) continue
@@ -165,7 +172,8 @@ async function follow(
     const g = ground(view, stamp.x, stamp.z, bounds)
     if (!g) continue
     if (isWater(g.name)) {
-      waterColumn(view, stamp, g, mats, preset, options, bounds, cells, floors)
+      if (options.water === 'causeway') causeway(view, stamp, g, mats, preset, options, bounds, cells, floors)
+      else wet.push({ stamp, waterY: g.y })
       continue
     }
     const alt = stamp.role === 'center' && hash01(stamp.x, stamp.z) < 0.15
@@ -187,9 +195,14 @@ async function follow(
     if (name === 'dirt_path') solidUnder(view, stamp.x, y, stamp.z, 'dirt', cells)
     dress(stamp, y, mats, preset, options, cells)
   }
+  if (wet.length) {
+    placeBridge(view, wet, bridgeDesign(options), bounds, (x, y, z, name, properties) => {
+      put(cells, x, y, z, name, properties)
+    }, floors)
+  }
 }
 
-function waterColumn(
+function causeway(
   view: ColumnView,
   stamp: Stamp,
   g: Ground,
@@ -202,30 +215,14 @@ function waterColumn(
 ) {
   const alt = stamp.role === 'center' && hash01(stamp.x, stamp.z) < 0.15
   const surface = stamp.role === 'center' ? (alt ? mats.centerAlt : mats.center) : stamp.role === 'edge' ? mats.border : mats.shoulder
-  if (options.water === 'causeway') {
-    let bottom = g.y
-    while (bottom - 1 >= bounds.minY && isWater(view.get(stamp.x, bottom - 1, stamp.z).name)) bottom--
-    for (let y = bottom; y <= g.y; y++) put(cells, stamp.x, y, stamp.z, mats.fill, {})
-    put(cells, stamp.x, g.y + 1, stamp.z, surface, {})
-    floors.push({ x: stamp.x, z: stamp.z, y: g.y + 1 })
-    if (surface === 'dirt_path') solidUnder(view, stamp.x, g.y + 1, stamp.z, mats.fill, cells)
-    clearHeadroom(view, stamp.x, g.y + 1, stamp.z, cells)
-    dress(stamp, g.y + 1, mats, preset, options, cells)
-    return
-  }
-  const deck = g.y + 1
-  put(cells, stamp.x, deck, stamp.z, surface, {})
-  floors.push({ x: stamp.x, z: stamp.z, y: deck })
-  if (surface === 'dirt_path') put(cells, stamp.x, g.y, stamp.z, 'dirt', {})
-  if (stamp.role === 'center' && stamp.along % 4 === 0) {
-    for (let y = deck - 1, left = 0; y >= bounds.minY && left < 24; y--, left++) {
-      const name = view.get(stamp.x, y, stamp.z).name
-      if (!isAir(name) && !isWater(name) && !isHeadroom(name)) break
-      put(cells, stamp.x, y, stamp.z, mats.support, mats.support.endsWith('_fence') ? fenceProps() : {})
-    }
-  }
-  clearHeadroom(view, stamp.x, deck, stamp.z, cells)
-  dress(stamp, deck, mats, preset, options, cells)
+  let bottom = g.y
+  while (bottom - 1 >= bounds.minY && isWater(view.get(stamp.x, bottom - 1, stamp.z).name)) bottom--
+  for (let y = bottom; y <= g.y; y++) put(cells, stamp.x, y, stamp.z, mats.fill, {})
+  put(cells, stamp.x, g.y + 1, stamp.z, surface, {})
+  floors.push({ x: stamp.x, z: stamp.z, y: g.y + 1 })
+  if (surface === 'dirt_path') solidUnder(view, stamp.x, g.y + 1, stamp.z, mats.fill, cells)
+  clearHeadroom(view, stamp.x, g.y + 1, stamp.z, cells)
+  dress(stamp, g.y + 1, mats, preset, options, cells)
 }
 
 async function tunnel(

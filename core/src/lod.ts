@@ -1,18 +1,5 @@
+/** How many full 16×16 tiles to decode per pass. The view still loads every visible chunk. */
 export const DETAIL_CHUNK_BUDGET = 96
-/** Full 16×16 tiles stay interactive under this many chunks in view. Past it, the map samples. */
-export const DETAIL_CHUNK_CAP = 128
-/** Target sample count for an overview of a large view. */
-export const OVERVIEW_BUDGET = 280
-export const OVERVIEW_CHUNK_BUDGET = 240
-
-/**
- * 1 loads every occupied chunk. Above DETAIL_CHUNK_CAP, grow the stride so the
- * sample count stays near OVERVIEW_BUDGET instead of decoding the whole view.
- */
-export function viewStride(occupied: number): number {
-  if (occupied <= DETAIL_CHUNK_CAP) return 1
-  return Math.max(2, Math.ceil(Math.sqrt(occupied / OVERVIEW_BUDGET)))
-}
 export const MAX_PIXELS_PER_BLOCK = 32
 /** Farthest zoom. A 1000px-wide view still covers 250,000 blocks. */
 export const MIN_PIXELS_PER_BLOCK = 0.004

@@ -6,19 +6,36 @@ export type WidthOption = 'narrow' | 'normal' | 'wide'
 export type HillsOption = 'follow' | 'tunnel'
 export type WaterOption = 'bridge' | 'causeway'
 export type DressingOption = 'off' | 'subtle' | 'lined'
+export const BRIDGE_DESIGNS = ['dock', 'timber', 'arch', 'masonry'] as const
+export type BridgeDesign = typeof BRIDGE_DESIGNS[number]
 
 export interface PathOptions {
   width: WidthOption
   hills: HillsOption
   water: WaterOption
   dressing: DressingOption
+  /** Used when water is bridge. Missing values from older options are timber. */
+  design: BridgeDesign
 }
 
 export const DEFAULT_OPTIONS: PathOptions = {
   width: 'normal',
   hills: 'follow',
   water: 'bridge',
-  dressing: 'subtle'
+  dressing: 'subtle',
+  design: 'timber'
+}
+
+export function bridgeDesign(options: Partial<PathOptions> | null | undefined): BridgeDesign {
+  const design = options?.design
+  if (design === 'dock' || design === 'timber' || design === 'arch' || design === 'masonry') return design
+  return 'timber'
+}
+
+export function normalizeOptions(options: PathOptions): PathOptions {
+  const design = bridgeDesign(options)
+  if (options.design === design) return options
+  return { ...options, design }
 }
 
 export interface NamedPath {

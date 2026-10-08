@@ -187,8 +187,7 @@ ipcMain.handle('tiles', async (event, query) => {
           if (token === mapToken) event.sender.send('map-progress', message)
         },
         cancelled: () => token !== mapToken,
-        release: true,
-        quality: query.quality === 'color' ? 'color' : 'full'
+        release: true
       })
       if (token !== mapToken || map.aborted) return { ok: false, cancelled: true }
       return {

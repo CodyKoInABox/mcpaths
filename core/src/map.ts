@@ -221,47 +221,17 @@ export async function sampleMap(
 }
 
 export interface TileHooks extends LoadHooks {
-  /** Drop clean columns after the color is cached so a large map does not keep every chunk decoded. */
+  /** Drop clean columns after the surface tile is cached so a large map does not keep every chunk decoded. */
   release?: boolean
-  /** `color` is one averaged sample per chunk, for a zoomed-out view. */
-  quality?: 'full' | 'color'
 }
 
-const COLOR_AT: readonly [number, number][] = [[4, 4], [4, 11], [11, 4], [11, 11]]
-
-function averageColor(samples: [number, number, number][]): Uint8Array {
-  let r = 0
-  let g = 0
-  let b = 0
-  for (const sample of samples) {
-    r += sample[0]
-    g += sample[1]
-    b += sample[2]
-  }
-  const n = samples.length || 1
-  return Uint8Array.of(Math.round(r / n), Math.round(g / n), Math.round(b / n))
-}
-
-function colorFromTile(tile: Uint8Array): Uint8Array {
-  return averageColor(COLOR_AT.map(([x, z]) => {
-    const i = (z * 16 + x) * 3
-    return [tile[i] ?? 0, tile[i + 1] ?? 0, tile[i + 2] ?? 0]
-  }))
-}
-
-function colorFromColumn(column: any): Uint8Array {
-  return averageColor(COLOR_AT.map(([lx, lz]) => columnColor(column, lx, lz)))
-}
-
-/** Full-resolution chunk images, or one color per chunk. A bad chunk is red and does not drop the rest. */
+/** One 16×16 image per chunk, one texel per block. A bad chunk is red and does not drop the rest. */
 export async function sampleTiles(
   world: World,
   dim: Dimension,
   chunks: { cx: number, cz: number }[],
   hooks?: TileHooks
 ): Promise<ChunkTiles> {
-  const colorMode = hooks?.quality === 'color'
-  const bytes = colorMode ? 3 : CHUNK_TILE_BYTES
   const ordered = chunks.slice().sort((a, b) => {
     const ar = regionOf(a.cx, a.cz)
     const br = regionOf(b.cx, b.cz)
@@ -270,8 +240,7 @@ export async function sampleTiles(
   const missing: { cx: number, cz: number }[] = []
   for (const chunk of ordered) {
     if (world.chunkError(dim, chunk.cx, chunk.cz)) continue
-    if (colorMode && (world.cachedColor(dim, chunk.cx, chunk.cz) || world.cachedSurface(dim, chunk.cx, chunk.cz))) continue
-    if (!colorMode && world.cachedSurface(dim, chunk.cx, chunk.cz)) continue
+    if (world.cachedSurface(dim, chunk.cx, chunk.cz)) continue
     if (world.columnOf(dim, chunk.cx, chunk.cz)) continue
     missing.push(chunk)
   }
@@ -284,51 +253,32 @@ export async function sampleTiles(
   }
   const cx: number[] = []
   const cz: number[] = []
-  const rgb = new Uint8Array(ordered.length * bytes)
+  const rgb = new Uint8Array(ordered.length * CHUNK_TILE_BYTES)
   let failed = 0
   let colored = 0
   for (const chunk of ordered) {
     if (hooks?.cancelled?.()) {
-      return { cx, cz, rgb: rgb.subarray(0, cx.length * bytes), failed, aborted: true }
+      return { cx, cz, rgb: rgb.subarray(0, cx.length * CHUNK_TILE_BYTES), failed, aborted: true }
     }
-    const offset = cx.length * bytes
+    const offset = cx.length * CHUNK_TILE_BYTES
     cx.push(chunk.cx)
     cz.push(chunk.cz)
-    if (colorMode) {
-      let color = world.cachedColor(dim, chunk.cx, chunk.cz)
-      if (!color) {
-        const error = world.chunkError(dim, chunk.cx, chunk.cz)
-        const full = world.cachedSurface(dim, chunk.cx, chunk.cz)
-        if (error) {
-          failed++
-          color = Uint8Array.of(140, 72, 72)
-        } else if (full) color = colorFromTile(full)
-        else {
-          const column = world.columnOf(dim, chunk.cx, chunk.cz)
-          color = column ? colorFromColumn(column) : Uint8Array.of(VOID_COLOR[0], VOID_COLOR[1], VOID_COLOR[2])
-        }
-        world.cacheColor(dim, chunk.cx, chunk.cz, color)
+    let tile = world.cachedSurface(dim, chunk.cx, chunk.cz)
+    if (!tile) {
+      const error = world.chunkError(dim, chunk.cx, chunk.cz)
+      if (error) {
+        failed++
+        tile = solidTile(140, 72, 72)
+      } else {
+        const column = world.columnOf(dim, chunk.cx, chunk.cz)
+        tile = column ? renderSurface(column) : solidTile(VOID_COLOR[0], VOID_COLOR[1], VOID_COLOR[2])
       }
-      rgb.set(color.subarray(0, 3), offset)
-    } else {
-      let tile = world.cachedSurface(dim, chunk.cx, chunk.cz)
-      if (!tile) {
-        const error = world.chunkError(dim, chunk.cx, chunk.cz)
-        if (error) {
-          failed++
-          tile = solidTile(140, 72, 72)
-        } else {
-          const column = world.columnOf(dim, chunk.cx, chunk.cz)
-          tile = column ? renderSurface(column) : solidTile(VOID_COLOR[0], VOID_COLOR[1], VOID_COLOR[2])
-        }
-        world.cacheSurface(dim, chunk.cx, chunk.cz, tile)
-        world.cacheColor(dim, chunk.cx, chunk.cz, colorFromTile(tile))
-      }
-      rgb.set(tile.subarray(0, CHUNK_TILE_BYTES), offset)
+      world.cacheSurface(dim, chunk.cx, chunk.cz, tile)
     }
+    rgb.set(tile.subarray(0, CHUNK_TILE_BYTES), offset)
     if (hooks?.release) world.releaseColumn(dim, chunk.cx, chunk.cz)
     colored++
     if (colored % 16 === 0) hooks?.progress?.(`Rendering chunks ${colored}…`)
   }
-  return { cx, cz, rgb: rgb.subarray(0, cx.length * bytes), failed, aborted: false }
+  return { cx, cz, rgb: rgb.subarray(0, cx.length * CHUNK_TILE_BYTES), failed, aborted: false }
 }

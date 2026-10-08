@@ -4,14 +4,13 @@ import { DATA_VERSION_26_2 } from '../src/versions'
 import {
   CHUNK_TILE,
   CHUNK_TILE_BYTES,
-  DETAIL_CHUNK_CAP,
   farPixelsPerBlock,
   MIN_PIXELS_PER_BLOCK,
   sampleTiles,
   sliderToZoom,
-  viewStride,
   zoomToSlider
 } from '../src'
+import { scanViewport } from '../src/viewscan'
 import { buildFixture } from './fixture'
 
 test('far zoom fits the explored area and is much wider than the old 0.5 floor', () => {
@@ -45,23 +44,23 @@ function uniqueColors(rgb: Uint8Array): number {
   return seen.size
 }
 
-test('overview stride stays near a few hundred samples', () => {
-  assert.equal(viewStride(1), 1)
-  assert.equal(viewStride(DETAIL_CHUNK_CAP), 1)
-  assert.ok(viewStride(DETAIL_CHUNK_CAP + 1) >= 2)
-  const stride = viewStride(40000)
-  assert.ok(stride >= 2)
-  assert.ok(Math.ceil(40000 / (stride * stride)) < 800)
+test('a view past the old 128-chunk cap still lists every occupied chunk', () => {
+  const present = new Uint8Array(128)
+  present.fill(255)
+  const list = [{ rx: 0, rz: 0, present }]
+  const scanned = scanViewport(0, 0, 32 * 16 - 1, 32 * 16 - 1, new Map([['0,0', present]]), list)
+  assert.equal(scanned.count, 1024)
+  assert.equal(scanned.chunks.length, 1024)
 })
 
-test('color tiles are 3 bytes and release the decoded column', async () => {
+test('full tiles are one color per block and release the decoded column', async () => {
   const { world } = await buildFixture(DATA_VERSION_26_2)
-  const color = await sampleTiles(world, 'overworld', [{ cx: 0, cz: 0 }], { quality: 'color', release: true })
+  const color = await sampleTiles(world, 'overworld', [{ cx: 0, cz: 0 }], { release: true })
   assert.equal(color.aborted, false)
-  assert.equal(color.rgb.length, 3)
-  assert.ok(color.rgb.some(byte => byte > 40))
+  assert.equal(color.rgb.length, CHUNK_TILE_BYTES)
+  assert.ok(uniqueColors(color.rgb) > 4)
   assert.equal(world.columnOf('overworld', 0, 0), null)
-  const again = await sampleTiles(world, 'overworld', [{ cx: 0, cz: 0 }], { quality: 'color', release: true })
+  const again = await sampleTiles(world, 'overworld', [{ cx: 0, cz: 0 }], { release: true })
   assert.deepEqual(again.rgb, color.rgb)
   await world.close()
 })

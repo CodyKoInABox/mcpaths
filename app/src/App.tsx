@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
-import { DETAIL_CHUNK_BUDGET, MAX_PIXELS_PER_BLOCK, MIN_PIXELS_PER_BLOCK, OVERVIEW_CHUNK_BUDGET, farPixelsPerBlock, sliderToZoom, zoomToSlider } from './lod'
+import { DETAIL_CHUNK_BUDGET, MAX_PIXELS_PER_BLOCK, MIN_PIXELS_PER_BLOCK, farPixelsPerBlock, sliderToZoom, zoomToSlider } from './lod'
 import { scanViewport } from '../../core/src/viewscan'
 import { paintSwatch } from './swatches'
 import {
   DEFAULT_OPTIONS,
   PRESETS,
+  type BridgeDesign,
   type Dimension,
   type PathOptions,
   type PresetId,
@@ -26,6 +27,13 @@ const COLORS: Record<string, string> = {
   smooth_sandstone: '#e2d2a4',
   sandstone: '#d2c094',
   spruce_planks: '#8a6238',
+  oak_planks: '#a67c52',
+  oak_slab: '#a67c52',
+  oak_log: '#6b5030',
+  oak_fence: '#a67c52',
+  sand: '#dbd3a2',
+  lantern: '#f0c85a',
+  stone_brick_wall: '#8d8d8d',
   gravel: '#a39898',
   packed_ice: '#b7d4ef',
   air: '#00000000'
@@ -58,6 +66,13 @@ const DRESSING_BLURB: Record<PathOptions['dressing'], string> = {
   subtle: 'A few plants on trail, moss, and adaptive edges. Cobble gets a lamp post about every 16 blocks.',
   lined: 'Denser plants. Cobble posts about every 8 blocks. Fences, including boardwalks, get a lantern every 8 blocks.'
 }
+
+const BRIDGE_LINES: { id: BridgeDesign, label: string, line: string }[] = [
+  { id: 'dock', label: 'Dock', line: 'Low oak pier on the water: plank and slab deck, fence rails, lantern posts, and a roofed shelter on a long span.' },
+  { id: 'timber', label: 'Timber', line: 'Raised oak deck on spaced log piers with stone footings, fence rails, and lanterns.' },
+  { id: 'arch', label: 'Arch', line: 'Stone-brick deck, crenellated parapets, thick piers, and open arches down to the river bed.' },
+  { id: 'masonry', label: 'Masonry', line: 'Stone-brick arches and low parapets, a sand path down the middle, lanterns on brick posts.' }
+]
 
 type MapPhase = 'loading' | 'ready' | 'empty' | 'error'
 const TILE = 16
@@ -101,8 +116,6 @@ export function App() {
   const busyRef = useRef(false)
   const previewSeq = useRef(0)
   const pathStore = useRef<Record<Dimension, SurveyPath[]>>({ overworld: [], nether: [], end: [] })
-  const overviewRef = useRef(new Map<string, OverviewCell>())
-  const lodRef = useRef({ stride: 1 })
   const visibleChunks = useRef<{ cx: number, cz: number }[]>([])
   const dragPoints = useRef<XZ[] | null>(null)
   const stampRef = useRef({ w: 0, h: 0, data: new Uint32Array(0), stamp: 1 })
@@ -123,8 +136,6 @@ export function App() {
     maskRef.current = new Map()
     maskListRef.current = []
     tilesRef.current = new Map()
-    overviewRef.current = new Map()
-    lodRef.current.stride = 1
     spanRef.current = null
     minZoomRef.current = MIN_PIXELS_PER_BLOCK
     setMinZoom(MIN_PIXELS_PER_BLOCK)
@@ -242,12 +253,6 @@ export function App() {
         maskRef.current,
         maskListRef.current
       )
-      lodRef.current.stride = scanned.stride
-      if (scanned.stride > 1) {
-        visibleChunks.current = []
-        await fillOverview(seq, passForce, scanned.picks, scanned.count, scanned.stride)
-        return
-      }
       const occupied = scanned.chunks
       visibleChunks.current = occupied
       const missing = occupied.filter(chunk => !tilesRef.current.has(tileKey(dim, chunk.cx, chunk.cz)))
@@ -340,106 +345,8 @@ export function App() {
       }
     }
 
-    async function fillOverview(seq: number, passForce: boolean, picks: { cx: number, cz: number, sx: number, sz: number }[], count: number, stride: number) {
-      const missing = picks.filter(pick => !overviewRef.current.has(overviewKey(dim, pick.sx, pick.sz, stride)))
-      if (missing.length === 0) {
-        if (seq !== sampleSeq.current) return
-        if (!regionsReady.current && count === 0) {
-          setMapPhase('loading')
-          setMapMessage('Indexing regions…')
-        } else if (count === 0 && jumpToTerrain()) {
-          void sampleRef.current()
-          return
-        } else {
-          setMapPhase('ready')
-          setMapMessage(count === 0 ? '' : 'Overview — zoom in for every block')
-        }
-        paintRef.current()
-        return
-      }
-      const total = picks.length
-      let done = total - missing.length
-      setMapPhase('loading')
-      setMapMessage(`Overview ${done} / ${total}…`)
-      paintRef.current()
-      let live = true
-      const off = window.mcpaths.onMapProgress(message => {
-        if (live && seq === sampleSeq.current) setMapMessage(message)
-      })
-      try {
-        let first = passForce
-        let failed = 0
-        const byChunk = new Map(picks.map(pick => [`${pick.cx},${pick.cz}`, pick]))
-        for (let i = 0; i < missing.length; i += OVERVIEW_CHUNK_BUDGET) {
-          if (seq !== sampleSeq.current || !worldRef.current) return
-          const batch = missing.slice(i, i + OVERVIEW_CHUNK_BUDGET)
-          const result = await window.mcpaths.tiles({
-            dim,
-            chunks: batch.map(pick => ({ cx: pick.cx, cz: pick.cz })),
-            force: first,
-            quality: 'color'
-          })
-          first = false
-          if (seq !== sampleSeq.current || !worldRef.current) return
-          if (result.cancelled) return
-          if (!result.ok || !result.data) {
-            setMapPhase('error')
-            setMapMessage(result.error || 'The map could not be read.')
-            note(result.error || 'The map could not be read.', true)
-            paintRef.current()
-            return
-          }
-          const cx = numberList(result.data.cx)
-          const cz = numberList(result.data.cz)
-          const rgb = bytesOf(result.data.rgb)
-          const count = Math.min(cx.length, cz.length, Math.floor(rgb.length / 3))
-          for (let n = 0; n < count; n++) {
-            const pick = byChunk.get(`${cx[n]},${cz[n]}`)
-            if (!pick) continue
-            const i0 = n * 3
-            overviewRef.current.set(overviewKey(dim, pick.sx, pick.sz, stride), {
-              dim,
-              cx: pick.sx,
-              cz: pick.sz,
-              stride,
-              rgb: [rgb[i0] ?? 0, rgb[i0 + 1] ?? 0, rgb[i0 + 2] ?? 0]
-            })
-          }
-          failed += result.data.failed || 0
-          done += count
-          paintRef.current()
-          setMapMessage(`Overview ${Math.min(done, total)} / ${total}…`)
-          await new Promise<void>(resolve => { window.setTimeout(resolve, 0) })
-          if (seq !== sampleSeq.current || !worldRef.current) return
-        }
-        if (seq !== sampleSeq.current) return
-        live = false
-        if (failed > 0 && done === 0) {
-          setMapPhase('error')
-          setMapMessage('Region files could not be read.')
-          note('Region files could not be read.', true)
-          return
-        }
-        setMapPhase('ready')
-        setMapMessage('Overview — zoom in for every block')
-        if (failed > 0) note(`${failed} chunk${failed === 1 ? '' : 's'} could not be read.`, true)
-      } catch (error) {
-        if (seq !== sampleSeq.current || !worldRef.current) return
-        const message = error instanceof Error ? error.message : 'The map could not be read.'
-        setMapPhase('error')
-        setMapMessage(message)
-        note(message, true)
-        paintRef.current()
-      } finally {
-        off()
-      }
-    }
-
     const seq = ++sampleSeq.current
-    if (force) {
-      tilesRef.current.clear()
-      overviewRef.current.clear()
-    }
+    if (force) tilesRef.current.clear()
     paintRef.current()
     await fillTiles(seq, force)
   }, [dim, jumpToTerrain])
@@ -467,9 +374,8 @@ export function App() {
     const scale = view.current.scale
     const originX = view.current.originX
     const originZ = view.current.originZ
-    if (lodRef.current.stride > 1) drawOverview(ctx, cssW, cssH, originX, originZ, scale, dim, overviewRef.current, lodRef.current.stride)
-    else drawChunkList(ctx, cssW, cssH, originX, originZ, scale, visibleChunks.current, tilesRef.current, dim)
-    if (lodRef.current.stride === 1 && 16 * scale >= 8) strokeGrid(ctx, cssW, cssH, originX, originZ, scale, 16, 'rgba(232, 238, 246, 0.16)', 1)
+    drawChunkList(ctx, cssW, cssH, originX, originZ, scale, visibleChunks.current, tilesRef.current, dim)
+    if (16 * scale >= 8) strokeGrid(ctx, cssW, cssH, originX, originZ, scale, 16, 'rgba(232, 238, 246, 0.16)', 1)
     if (512 * scale >= 16) strokeGrid(ctx, cssW, cssH, originX, originZ, scale, 512, 'rgba(232, 238, 246, 0.28)', 1)
     const current = worldRef.current
     if (current && dim === 'overworld') {
@@ -502,9 +408,7 @@ export function App() {
       }
     }
     if (visibleRef.current) {
-      visibleRef.current.textContent = lodRef.current.stride > 1
-        ? 'overview'
-        : `${visibleChunks.current.length} chunks in view`
+      visibleRef.current.textContent = `${visibleChunks.current.length} chunks in view`
     }
   }, [paths, activeId, preview, dim])
 
@@ -521,9 +425,7 @@ export function App() {
     }
     pendingFocus.current = focusOf(world.info, dim)
     tilesRef.current = new Map()
-    overviewRef.current = new Map()
     visibleChunks.current = []
-    lodRef.current.stride = 1
     spanRef.current = null
     maskRef.current = new Map()
     maskListRef.current = []
@@ -587,7 +489,7 @@ export function App() {
       name: path.name,
       points: path.points,
       preset: path.preset,
-      options: path.options
+      options: withDesign(path.options)
     }))
     if (ready.length === 0) {
       setPreview([])
@@ -836,7 +738,7 @@ export function App() {
     try {
       const result = await window.mcpaths.apply({
         dim,
-        paths: ready.map(path => ({ name: path.name, points: path.points, preset: path.preset, options: path.options }))
+        paths: ready.map(path => ({ name: path.name, points: path.points, preset: path.preset, options: withDesign(path.options) }))
       })
       if (!result.ok) note(result.error || 'Apply failed.', true)
       else {
@@ -895,8 +797,6 @@ export function App() {
     previewSeq.current++
     worldRef.current = null
     tilesRef.current = new Map()
-    overviewRef.current = new Map()
-    lodRef.current.stride = 1
     spanRef.current = null
     pathStore.current = { overworld: [], nether: [], end: [] }
     setPreview([])
@@ -1182,6 +1082,11 @@ function newPath(name: string): SurveyPath {
   return { id: crypto.randomUUID(), name, points: [], preset: 'trail', options: { ...DEFAULT_OPTIONS }, draft: true }
 }
 
+function withDesign(options: PathOptions): PathOptions {
+  if (options.design === 'dock' || options.design === 'timber' || options.design === 'arch' || options.design === 'masonry') return options
+  return { ...options, design: 'timber' }
+}
+
 function Swatch({ preset }: { preset: PresetId }) {
   const ref = useRef<HTMLCanvasElement>(null)
   useEffect(() => { if (ref.current) paintSwatch(ref.current, preset) }, [preset])
@@ -1190,12 +1095,19 @@ function Swatch({ preset }: { preset: PresetId }) {
 
 function Options({ preset, value, onChange }: { preset: PresetId, value: PathOptions, onChange: (value: PathOptions) => void }) {
   const tunnel = value.hills === 'tunnel'
+  const designOff = tunnel || value.water !== 'bridge'
   const dressingOff = tunnel || preset === 'sandstone'
   const dressingHint = tunnel
     ? 'Not used while Tunnel is on. The tunnel already places stone lining and lanterns.'
     : preset === 'sandstone'
       ? 'Not used for Sandstone way. That preset has no plants or lamp posts.'
       : DRESSING_BLURB[value.dressing]
+  const designHint = tunnel
+    ? 'Not used while Tunnel is on. A tunnel skips water instead of crossing it.'
+    : value.water !== 'bridge'
+      ? 'Not used for a causeway. A causeway fills the water and paves the top with this preset.'
+      : 'Only the water uses this. On land the path preset still applies, including its dressing.'
+  const design = value.design ?? 'timber'
   return (
     <div className="options">
       <Choice
@@ -1217,10 +1129,25 @@ function Options({ preset, value, onChange }: { preset: PresetId, value: PathOpt
         <legend>Water</legend>
         <p className="hint">{tunnel
           ? 'Not used while Tunnel is on. A tunnel skips water instead of crossing it.'
-          : 'Bridge decks one block above the water and puts a support under the center every 4 blocks. Causeway fills the water and paves the top.'}</p>
+          : 'Bridge uses the design below and only replaces water. Causeway fills the water and paves the top with this preset.'}</p>
         <div className="diagrams">
           <Diagram disabled={tunnel} on={value.water === 'bridge'} kind="bridge" onClick={() => onChange({ ...value, water: 'bridge' })} />
           <Diagram disabled={tunnel} on={value.water === 'causeway'} kind="causeway" onClick={() => onChange({ ...value, water: 'causeway' })} />
+        </div>
+        <div className={designOff && !tunnel ? 'designs is-idle' : 'designs'}>
+          <p className="hint">{designHint}</p>
+          {BRIDGE_LINES.map(item => (
+            <button
+              type="button"
+              key={item.id}
+              className={design === item.id ? 'on' : ''}
+              disabled={designOff}
+              onClick={() => onChange({ ...value, design: item.id })}
+            >
+              <strong>{item.label}</strong>
+              <span>{item.line}</span>
+            </button>
+          ))}
         </div>
       </fieldset>
       <Choice
@@ -1255,7 +1182,7 @@ function Diagram({ kind, on, disabled, onClick }: { kind: 'follow' | 'tunnel' | 
     : kind === 'tunnel'
       ? 'Cut a level passage through the hill'
       : kind === 'bridge'
-        ? 'Deck over water'
+        ? 'Cross on the design below'
         : 'Fill water, then pave'
   return (
     <button type="button" className={on ? 'diagram on' : 'diagram'} disabled={disabled} title={detail} onClick={onClick}>
@@ -1479,19 +1406,9 @@ function exploredSpan(list: { rx: number, rz: number, present: Uint8Array }[]): 
   return { w: (maxCX - minCX + 1) * 16, h: (maxCZ - minCZ + 1) * 16 }
 }
 
-interface OverviewCell {
-  dim: string
-  cx: number
-  cz: number
-  stride: number
-  rgb: [number, number, number]
-}
 
 interface StampBuf { w: number, h: number, data: Uint32Array, stamp: number }
 
-function overviewKey(dim: string, cx: number, cz: number, stride: number): string {
-  return `${dim}:${cx},${cz}:${stride}`
-}
 
 function drawChunkList(
   ctx: CanvasRenderingContext2D,
@@ -1520,27 +1437,6 @@ function drawChunkList(
   }
 }
 
-function drawOverview(
-  ctx: CanvasRenderingContext2D,
-  cssW: number,
-  cssH: number,
-  originX: number,
-  originZ: number,
-  scale: number,
-  dim: string,
-  cells: Map<string, OverviewCell>,
-  stride: number
-) {
-  const size = stride * 16 * scale
-  for (const cell of cells.values()) {
-    if (cell.dim !== dim || cell.stride !== stride) continue
-    const sx = (cell.cx * 16 - originX) * scale
-    const sz = (cell.cz * 16 - originZ) * scale
-    if (sx + size < 0 || sz + size < 0 || sx > cssW || sz > cssH) continue
-    ctx.fillStyle = `rgb(${cell.rgb[0]}, ${cell.rgb[1]}, ${cell.rgb[2]})`
-    ctx.fillRect(sx, sz, Math.max(size, 1), Math.max(size, 1))
-  }
-}
 
 function drawPreview(
   ctx: CanvasRenderingContext2D,

@@ -18,7 +18,7 @@ function mask(rx: number, rz: number, fill: 'all' | number[]): RegionBits {
   return { rx, rz, present }
 }
 
-/** Full occupied list, same region order as scanViewport. The overview path must match a decimation of this. */
+/** Full occupied list, same region order as scanViewport. */
 function slowChunks(
   originX: number,
   originZ: number,
@@ -67,17 +67,6 @@ function slowChunks(
   return chunks
 }
 
-function slowDecimate(chunks: { cx: number, cz: number }[], stride: number) {
-  const cells = new Map<string, { cx: number, cz: number, sx: number, sz: number }>()
-  for (const chunk of chunks) {
-    const sx = Math.floor(chunk.cx / stride) * stride
-    const sz = Math.floor(chunk.cz / stride) * stride
-    const key = `${sx},${sz}`
-    if (!cells.has(key)) cells.set(key, { cx: chunk.cx, cz: chunk.cz, sx, sz })
-  }
-  return [...cells.values()]
-}
-
 function expectScan(
   originX: number,
   originZ: number,
@@ -89,14 +78,7 @@ function expectScan(
   const scanned = scanViewport(originX, originZ, spanX, spanZ, masks, list)
   const all = slowChunks(originX, originZ, spanX, spanZ, masks, list)
   assert.equal(scanned.count, all.length)
-  if (scanned.stride === 1) {
-    assert.deepEqual(scanned.chunks, all)
-    assert.deepEqual(scanned.picks, [])
-  } else {
-    assert.deepEqual(scanned.chunks, [])
-    assert.deepEqual(scanned.picks, slowDecimate(all, scanned.stride))
-    assert.ok(scanned.picks.length < all.length)
-  }
+  assert.deepEqual(scanned.chunks, all)
 }
 
 test('detail zoom lists every occupied chunk, including a clipped negative region', () => {
@@ -109,11 +91,11 @@ test('detail zoom lists every occupied chunk, including a clipped negative regio
   expectScan(-31 * 16, -31 * 16, 40, 40, list)
   const masks = new Map([['-1,-1', present]])
   const scanned = scanViewport(-31 * 16, -31 * 16, 40, 40, masks, list)
-  assert.equal(scanned.stride, 1)
+  assert.equal(scanned.count, 2)
   assert.deepEqual(scanned.chunks, [{ cx: -31, cz: -31 }, { cx: -30, cz: -31 }])
 })
 
-test('overview keeps the first occupied chunk per stride cell and does not allocate the full list', () => {
+test('a wide view lists every occupied chunk at full resolution', () => {
   const filled = mask(0, 0, 'all')
   const neighbor = mask(1, 0, 'all')
   expectScan(0, 0, 511, 511, [filled])
@@ -122,17 +104,17 @@ test('overview keeps the first occupied chunk per stride cell and does not alloc
   const wide = scanViewport(-32, -32, 96 * 16, 40 * 16, masks, [neighbor, filled])
   const all = slowChunks(-32, -32, 96 * 16, 40 * 16, masks, [neighbor, filled])
   assert.ok(all.length > 128)
-  assert.deepEqual(wide.chunks, [])
-  assert.deepEqual(wide.picks, slowDecimate(all, wide.stride))
+  assert.equal(wide.count, all.length)
+  assert.deepEqual(wide.chunks, all)
 })
 
-test('a full region popcount matches the bit walk', () => {
+test('a full region lists every occupied chunk', () => {
   const list = [mask(3, -2, 'all')]
   const masks = new Map(list.map(entry => [`${entry.rx},${entry.rz}`, entry.present]))
   const originX = 3 * 32 * 16
   const originZ = -2 * 32 * 16
   const scanned = scanViewport(originX, originZ, 511, 511, masks, list)
   assert.equal(scanned.count, 1024)
-  assert.equal(scanned.chunks.length, 0)
-  assert.ok(scanned.picks.length < 400)
+  assert.equal(scanned.chunks.length, 1024)
+  assert.deepEqual(scanned.chunks, slowChunks(originX, originZ, 511, 511, masks, list))
 })

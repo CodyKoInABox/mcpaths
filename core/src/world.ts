@@ -262,8 +262,6 @@ export class World {
   private regions = new Map<string, any>()
   private chunks = new Map<string, EditableChunk>()
   private surfaces = new Map<string, Uint8Array>()
-  /** 3-byte overview color, separate from the full 16×16 tile. */
-  private colors = new Map<string, Uint8Array>()
   private failures = new Map<string, string>()
   private masks = new Map<Dimension, Map<string, Buffer>>()
 
@@ -288,14 +286,12 @@ export class World {
     this.regions.clear()
     this.chunks.clear()
     this.surfaces.clear()
-    this.colors.clear()
     this.failures.clear()
     this.masks.clear()
   }
 
   clearMapCache() {
     this.surfaces.clear()
-    this.colors.clear()
     this.failures.clear()
   }
 
@@ -311,15 +307,7 @@ export class World {
     this.surfaces.set(chunkKey(dim, cx, cz), rgb)
   }
 
-  cachedColor(dim: Dimension, cx: number, cz: number): Uint8Array | null {
-    return this.colors.get(chunkKey(dim, cx, cz)) ?? null
-  }
-
-  cacheColor(dim: Dimension, cx: number, cz: number, rgb: Uint8Array) {
-    this.colors.set(chunkKey(dim, cx, cz), rgb.length === 3 ? rgb : rgb.slice(0, 3))
-  }
-
-  /** Drop a clean column after its map color is cached. Dirty edits stay. */
+  /** Drop a clean column after its surface tile is cached. Dirty edits stay. */
   releaseColumn(dim: Dimension, cx: number, cz: number) {
     const key = chunkKey(dim, cx, cz)
     const chunk = this.chunks.get(key)
@@ -517,9 +505,7 @@ export class World {
     chunk.dirty = true
     chunk.touched.add(Math.floor(y / 16))
     chunk.grounds = null
-    const key = chunkKey(dim, cx, cz)
-    this.surfaces.delete(key)
-    this.colors.delete(key)
+    this.surfaces.delete(chunkKey(dim, cx, cz))
   }
 
   setBiome(dim: Dimension, x: number, y: number, z: number, biome: string) {

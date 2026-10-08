@@ -1,16 +1,7 @@
-import { DETAIL_CHUNK_CAP, viewStride } from './lod'
-
 export interface RegionBits {
   rx: number
   rz: number
   present: Uint8Array
-}
-
-export interface ChunkPick {
-  cx: number
-  cz: number
-  sx: number
-  sz: number
 }
 
 interface Window {
@@ -23,9 +14,6 @@ interface Window {
   r0z: number
   r1z: number
 }
-
-const BYTE_BITS = new Uint8Array(256)
-for (let i = 1; i < 256; i++) BYTE_BITS[i] = (i & 1) + BYTE_BITS[i >> 1]
 
 function windowOf(originX: number, originZ: number, spanX: number, spanZ: number): Window {
   const maxX = originX + spanX
@@ -83,22 +71,6 @@ function eachRegion(bounds: Window, masks: Map<string, Uint8Array>, list: Region
   }
 }
 
-function countRegion(present: Uint8Array, lx0: number, lx1: number, lz0: number, lz1: number): number {
-  if (lx0 === 0 && lx1 === 31 && lz0 === 0 && lz1 === 31) {
-    let n = 0
-    const length = Math.min(present.length, 128)
-    for (let i = 0; i < length; i++) n += BYTE_BITS[present[i]] ?? 0
-    return n
-  }
-  let n = 0
-  for (let lz = lz0; lz <= lz1; lz++) {
-    for (let lx = lx0; lx <= lx1; lx++) {
-      if (bitSet(present, (lz << 5) | lx)) n++
-    }
-  }
-  return n
-}
-
 function collect(bounds: Window, masks: Map<string, Uint8Array>, list: RegionBits[]): { cx: number, cz: number }[] {
   const chunks: { cx: number, cz: number }[] = []
   eachRegion(bounds, masks, list, (rx, rz, present, lx0, lx1, lz0, lz1) => {
@@ -112,36 +84,7 @@ function collect(bounds: Window, masks: Map<string, Uint8Array>, list: RegionBit
   return chunks
 }
 
-function decimate(bounds: Window, masks: Map<string, Uint8Array>, list: RegionBits[], stride: number): ChunkPick[] {
-  const picked = new Map<string, ChunkPick>()
-  eachRegion(bounds, masks, list, (rx, rz, present, lx0, lx1, lz0, lz1) => {
-    for (let lz = lz0; lz <= lz1; lz++) {
-      const cz = rz * 32 + lz
-      const sz = Math.floor(cz / stride) * stride
-      let lx = lx0
-      while (lx <= lx1) {
-        const cx = rx * 32 + lx
-        const sx = Math.floor(cx / stride) * stride
-        const key = `${sx},${sz}`
-        if (picked.has(key) || bitSet(present, (lz << 5) | lx)) {
-          if (!picked.has(key)) picked.set(key, { cx, cz, sx, sz })
-          const next = sx + stride - rx * 32
-          lx = next > lx ? next : lx + 1
-          continue
-        }
-        lx++
-      }
-    }
-  })
-  return [...picked.values()]
-}
-
-/**
- * Chunks the map should load for this view.
- * At detail zoom, `chunks` is every occupied chunk.
- * Past that, `chunks` stays empty and `picks` is one occupied chunk per stride cell —
- * the same chunk a full list would have kept first. The full list is never allocated.
- */
+/** Every occupied chunk inside the view. Chunks fully outside the window are left out. */
 export function scanViewport(
   originX: number,
   originZ: number,
@@ -149,18 +92,7 @@ export function scanViewport(
   spanZ: number,
   masks: Map<string, Uint8Array>,
   list: RegionBits[]
-): { count: number, stride: number, chunks: { cx: number, cz: number }[], picks: ChunkPick[] } {
-  const bounds = windowOf(originX, originZ, spanX, spanZ)
-  const area = (bounds.c1x - bounds.c0x + 1) * (bounds.c1z - bounds.c0z + 1)
-  if (area <= DETAIL_CHUNK_CAP) {
-    const chunks = collect(bounds, masks, list)
-    return { count: chunks.length, stride: 1, chunks, picks: [] }
-  }
-  let count = 0
-  eachRegion(bounds, masks, list, (_rx, _rz, present, lx0, lx1, lz0, lz1) => {
-    count += countRegion(present, lx0, lx1, lz0, lz1)
-  })
-  const stride = viewStride(count)
-  if (stride === 1) return { count, stride, chunks: collect(bounds, masks, list), picks: [] }
-  return { count, stride, chunks: [], picks: decimate(bounds, masks, list, stride) }
+): { count: number, chunks: { cx: number, cz: number }[] } {
+  const chunks = collect(windowOf(originX, originZ, spanX, spanZ), masks, list)
+  return { count: chunks.length, chunks }
 }

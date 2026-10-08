@@ -128,9 +128,26 @@ test('follow changes a hill, tunnel carves, bridge spans, causeway fills', async
     preset: 'trail',
     options: { ...DEFAULT_OPTIONS, water: 'bridge', dressing: 'off' }
   }])
-  const deck = bridge.world.getBlock('overworld', 7, 63, 15).name
-  assert.ok(deck === 'dirt_path' || deck === 'rooted_dirt', deck)
-  assert.notEqual(bridge.world.getBlock('overworld', 7, 60, 15).name, 'air')
+  let plank = false
+  let pier = false
+  let gap = false
+  for (let x = 0; x < 16; x++) {
+    for (let y = 57; y <= 80; y++) {
+      const name = bridge.world.getBlock('overworld', x, y, 15).name
+      assert.notEqual(name, 'gravel')
+      assert.notEqual(name, 'dirt_path')
+      if (name !== 'oak_planks') continue
+      plank = true
+      if (bridge.world.getBlock('overworld', x, y - 3, 15).name === 'air') gap = true
+      for (let foot = 57; foot < y; foot++) {
+        if (bridge.world.getBlock('overworld', x, foot, 15).name === 'stone_bricks'
+          && bridge.world.getBlock('overworld', x, foot + 1, 15).name === 'oak_log') pier = true
+      }
+    }
+  }
+  assert.ok(plank, 'timber deck')
+  assert.ok(pier, 'log pier on a stone footing')
+  assert.ok(gap, 'open span under the deck')
   await bridge.world.close()
 
   const cause = await buildFixture(DATA_VERSION_26_3)
@@ -273,49 +290,169 @@ test('tunnel does not enter water', async () => {
   assert.ok(cells.some(cell => cell.name === 'stone_bricks'))
 })
 
-test('dressing stays plants and posts, including over water', async () => {
+test('dressing stays off the bridge and still dresses land', async () => {
   const water = [{ x: 0, z: 8 }, { x: 40, z: 8 }]
-  const board = await planPaths(lakeView(), [{
-    name: 'planks',
-    points: water,
-    preset: 'boardwalk',
-    options: { ...DEFAULT_OPTIONS, dressing: 'off', water: 'bridge' }
-  }], BOUNDS)
-  assert.ok(board.some(cell => cell.name === 'spruce_fence' && cell.y === 64))
-
   const bare = await planPaths(lakeView(), [{
     name: 'road',
     points: water,
     preset: 'cobble',
-    options: { ...DEFAULT_OPTIONS, dressing: 'off', water: 'bridge' }
+    options: { ...DEFAULT_OPTIONS, dressing: 'off', water: 'bridge', design: 'timber' }
   }], BOUNDS)
-  assert.equal(bare.some(cell => cell.name === 'oak_fence' || cell.name === 'lantern'), false)
-
-  const posted = await planPaths(lakeView(), [{
+  const lined = await planPaths(lakeView(), [{
     name: 'road',
     points: water,
     preset: 'cobble',
-    options: { ...DEFAULT_OPTIONS, dressing: 'subtle', water: 'bridge' }
+    options: { ...DEFAULT_OPTIONS, dressing: 'lined', water: 'bridge', design: 'timber' }
   }], BOUNDS)
-  const fences = posted.filter(cell => cell.name === 'oak_fence')
-  const deck = posted.filter(cell => cell.y === 63)
-  assert.ok(fences.length > 0)
-  assert.ok(fences.length * 4 < deck.length, `${fences.length} fences vs ${deck.length} deck`)
+  const sig = (cells: { x: number, y: number, z: number, name: string }[]) => cells.map(cell => `${cell.x},${cell.y},${cell.z},${cell.name}`).sort().join('|')
+  assert.equal(sig(bare), sig(lined))
+  assert.equal(bare.some(cell => cell.name === 'gravel' || cell.name === 'cobblestone'), false)
+  assert.ok(bare.some(cell => cell.name === 'oak_fence'))
+  assert.ok(bare.some(cell => cell.name === 'lantern'))
 
-  const off = await planPaths(grassView(), [{
+  const landOff = await planPaths(grassView(), [{
+    name: 'road',
+    points: [{ x: 0, z: 4 }, { x: 24, z: 4 }],
+    preset: 'cobble',
+    options: { ...DEFAULT_OPTIONS, dressing: 'off' }
+  }], BOUNDS)
+  const landLined = await planPaths(grassView(), [{
+    name: 'road',
+    points: [{ x: 0, z: 4 }, { x: 24, z: 4 }],
+    preset: 'cobble',
+    options: { ...DEFAULT_OPTIONS, dressing: 'lined' }
+  }], BOUNDS)
+  assert.equal(landOff.some(cell => cell.name === 'oak_fence'), false)
+  assert.ok(landLined.some(cell => cell.name === 'oak_fence'))
+
+  const sandOff = await planPaths(grassView(), [{
     name: 'sand',
     points: [{ x: 0, z: 4 }, { x: 20, z: 4 }],
     preset: 'sandstone',
     options: { ...DEFAULT_OPTIONS, dressing: 'off' }
   }], BOUNDS)
-  const lined = await planPaths(grassView(), [{
+  const sandLined = await planPaths(grassView(), [{
     name: 'sand',
     points: [{ x: 0, z: 4 }, { x: 20, z: 4 }],
     preset: 'sandstone',
     options: { ...DEFAULT_OPTIONS, dressing: 'lined' }
   }], BOUNDS)
-  const sig = (cells: { x: number, y: number, z: number, name: string }[]) => cells.map(cell => `${cell.x},${cell.y},${cell.z},${cell.name}`).sort().join('|')
-  assert.equal(sig(off), sig(lined))
+  assert.equal(sig(sandOff), sig(sandLined))
+})
+
+const SPAN = [{ x: 0, z: 8 }, { x: 48, z: 8 }]
+
+function above(cells: { x: number, y: number, z: number, name: string }[], name: string, over: string): boolean {
+  return cells.some(cell => cell.name === over && cells.some(other => other.name === name && other.x === cell.x && other.z === cell.z && other.y > cell.y))
+}
+
+test('each bridge design places its own blocks', async () => {
+  async function span(design: 'dock' | 'timber' | 'arch' | 'masonry') {
+    return planPaths(lakeView(), [{
+      name: design,
+      points: SPAN,
+      preset: 'cobble',
+      options: { ...DEFAULT_OPTIONS, water: 'bridge', dressing: 'lined', design }
+    }], BOUNDS)
+  }
+
+  const dock = await span('dock')
+  assert.ok(dock.some(cell => cell.name === 'oak_planks' && cell.y === 63))
+  assert.ok(dock.some(cell => cell.name === 'oak_slab'))
+  assert.ok(dock.some(cell => cell.name === 'oak_fence'))
+  assert.ok(dock.some(cell => cell.name === 'lantern'))
+  assert.ok(dock.some(cell => cell.name === 'oak_log' && cell.y <= 57))
+  assert.ok(dock.some(cell => cell.name === 'oak_planks' && cell.y >= 67), 'roofed shelter')
+  assert.equal(dock.some(cell => cell.name === 'stone_bricks' || cell.name === 'gravel' || cell.name === 'cobblestone'), false)
+
+  const timber = await span('timber')
+  assert.ok(timber.some(cell => cell.name === 'stone_bricks' && cell.y <= 57))
+  assert.ok(above(timber, 'oak_log', 'stone_bricks'))
+  assert.ok(above(timber, 'oak_planks', 'air'))
+  assert.ok(timber.some(cell => cell.name === 'air' && !timber.some(stone => stone.name === 'stone_bricks' && stone.x === cell.x && stone.z === cell.z)))
+  assert.ok(timber.some(cell => cell.name === 'oak_fence'))
+  assert.ok(timber.some(cell => cell.name === 'lantern'))
+  assert.equal(timber.some(cell => cell.name === 'gravel' || cell.name === 'dirt_path' || cell.name === 'cobblestone'), false)
+
+  const arch = await span('arch')
+  assert.ok(arch.some(cell => cell.name === 'stone_bricks' && cell.y <= 57))
+  assert.ok(above(arch, 'stone_bricks', 'air'))
+  assert.ok(arch.some(cell => cell.name === 'stone_brick_wall'))
+  assert.equal(arch.some(cell => cell.name === 'gravel' || cell.name === 'dirt' || cell.name === 'dirt_path' || cell.name === 'sand' || cell.name === 'lantern' || cell.name === 'oak_fence' || cell.name === 'cobblestone'), false)
+
+  const masonry = await span('masonry')
+  assert.ok(masonry.some(cell => cell.name === 'stone_bricks' && cell.y <= 57))
+  assert.ok(masonry.some(cell => cell.name === 'dirt_path'))
+  assert.ok(masonry.some(cell => cell.name === 'sand'))
+  assert.ok(masonry.some(cell => cell.name === 'lantern'))
+  assert.ok(above(masonry, 'stone_bricks', 'air'))
+  assert.equal(masonry.some(cell => (cell.name === 'dirt_path' || cell.name === 'sand') && cell.y <= 62), false)
+  assert.equal(masonry.some(cell => cell.name === 'gravel' || cell.name === 'cobblestone'), false)
+})
+
+test('a gravel or path preset does not become the bridge', async () => {
+  for (const design of ['dock', 'timber', 'arch', 'masonry'] as const) {
+    const cells = await planPaths(lakeView(), [{
+      name: design,
+      points: SPAN,
+      preset: 'cobble',
+      options: { ...DEFAULT_OPTIONS, water: 'bridge', dressing: 'lined', design }
+    }], BOUNDS)
+    assert.equal(cells.some(cell => cell.name === 'gravel'), false, design)
+  }
+  const trail = await planPaths(lakeView(), [{
+    name: 'trail',
+    points: SPAN,
+    preset: 'trail',
+    options: { ...DEFAULT_OPTIONS, water: 'bridge', dressing: 'off', design: 'timber' }
+  }], BOUNDS)
+  assert.equal(trail.some(cell => cell.name === 'dirt_path' || cell.name === 'gravel' || cell.name === 'coarse_dirt' || cell.name === 'rooted_dirt' || cell.name === 'dirt'), false)
+})
+
+test('a saved path without a design builds timber', async () => {
+  const cells = await planPaths(lakeView(), [{
+    name: 'old',
+    points: SPAN,
+    preset: 'trail',
+    options: { width: 'normal', hills: 'follow', water: 'bridge', dressing: 'off' } as typeof DEFAULT_OPTIONS
+  }], BOUNDS)
+  assert.ok(cells.some(cell => cell.name === 'oak_log'))
+  assert.ok(cells.some(cell => cell.name === 'stone_bricks'))
+  assert.equal(cells.some(cell => cell.name === 'dirt_path' || cell.name === 'gravel'), false)
+})
+
+test('bridge stays on the water and land keeps the preset', async () => {
+  const shore = 16
+  const cells = await planPaths({
+    get(_x, y, z) {
+      if (z >= shore) {
+        if (y >= 58 && y <= 62) return { name: 'water' }
+        if (y >= 1 && y <= 57) return { name: 'stone' }
+        return { name: 'air' }
+      }
+      if (y === 63) return { name: 'grass_block' }
+      if (y >= 1 && y <= 62) return { name: 'stone' }
+      return { name: 'air' }
+    },
+    biome() { return 'plains' },
+    protected() { return false },
+    ground(_x, z) {
+      return z >= shore ? { y: 62, name: 'water' } : { y: 63, name: 'grass_block' }
+    }
+  }, [{
+    name: 'cross',
+    points: [{ x: 0, z: 0 }, { x: 0, z: 40 }],
+    preset: 'cobble',
+    options: { ...DEFAULT_OPTIONS, water: 'bridge', dressing: 'lined', design: 'arch' }
+  }], BOUNDS)
+  const land = cells.filter(cell => cell.z < shore)
+  const wet = cells.filter(cell => cell.z >= shore)
+  assert.ok(land.some(cell => cell.name === 'cobblestone' || cell.name === 'mossy_cobblestone'))
+  assert.ok(land.some(cell => cell.name === 'gravel'))
+  assert.ok(land.some(cell => cell.name === 'oak_fence'))
+  assert.ok(wet.some(cell => cell.name === 'stone_bricks'))
+  assert.ok(wet.some(cell => cell.name === 'air'))
+  assert.equal(wet.some(cell => cell.name === 'gravel' || cell.name === 'cobblestone' || cell.name === 'oak_fence' || cell.name === 'dirt_path'), false)
 })
 
 test('preview drops clean columns and a cancel returns nothing', async () => {

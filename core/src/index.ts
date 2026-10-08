@@ -18,10 +18,7 @@ export {
   farPixelsPerBlock,
   zoomToSlider,
   sliderToZoom,
-  viewStride,
   DETAIL_CHUNK_BUDGET,
-  DETAIL_CHUNK_CAP,
-  OVERVIEW_BUDGET,
   MIN_PIXELS_PER_BLOCK,
   MAX_PIXELS_PER_BLOCK
 } from './lod'
@@ -40,7 +37,9 @@ export {
   DEFAULT_OPTIONS,
   widthBlocks,
   familyForBiome,
-  resolveMaterials
+  resolveMaterials,
+  normalizeOptions,
+  bridgeDesign
 } from './path/presets'
-export type { PresetId, PathOptions, NamedPath, WidthOption, HillsOption, WaterOption, DressingOption } from './path/presets'
+export type { PresetId, PathOptions, NamedPath, WidthOption, HillsOption, WaterOption, DressingOption, BridgeDesign } from './path/presets'
 export { colorFor } from './blocks'
