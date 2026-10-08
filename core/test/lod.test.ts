@@ -2,23 +2,15 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { DATA_VERSION_26_2 } from '../src/versions'
 import {
-  DETAIL_CHUNK_BUDGET,
+  CHUNK_TILE,
+  CHUNK_TILE_BYTES,
   farPixelsPerBlock,
   MIN_PIXELS_PER_BLOCK,
-  OVERVIEW_COLUMNS,
-  sampleOverview,
+  sampleTiles,
   sliderToZoom,
-  viewLod,
   zoomToSlider
 } from '../src'
 import { buildFixture } from './fixture'
-
-test('lod stays detailed inside the chunk budget and switches past it', () => {
-  assert.equal(viewLod(8, 12, DETAIL_CHUNK_BUDGET), 'detail')
-  assert.equal(viewLod(10, 10), 'overview')
-  assert.equal(viewLod(1, 1), 'detail')
-  assert.equal(viewLod(0, 40), 'detail')
-})
 
 test('far zoom fits the explored area and is much wider than the old 0.5 floor', () => {
   const wide = farPixelsPerBlock(1000, 800, 10000, 10000)
@@ -45,31 +37,30 @@ test('zoom slider is logarithmic and round-trips', () => {
   assert.ok(Math.abs(sliderToZoom(1, min, max) - max) < 1e-9)
 })
 
-test('overview samples four columns, eight blocks apart', () => {
-  assert.equal(OVERVIEW_COLUMNS.length, 4)
-  assert.deepEqual([...OVERVIEW_COLUMNS[0]], [4, 4])
-  assert.deepEqual([...OVERVIEW_COLUMNS[3]], [12, 12])
-  assert.equal(OVERVIEW_COLUMNS[1][0] - OVERVIEW_COLUMNS[0][0], 8)
-})
+function uniqueColors(rgb: Uint8Array): number {
+  const seen = new Set<string>()
+  for (let i = 0; i < rgb.length; i += 3) seen.add(`${rgb[i]},${rgb[i + 1]},${rgb[i + 2]}`)
+  return seen.size
+}
 
-test('overview colors a chunk from four columns and caches it', async () => {
+test('chunk tiles are one color per block and stay cached', async () => {
   const { world } = await buildFixture(DATA_VERSION_26_2)
-  const first = await sampleOverview(world, 'overworld', [{ cx: 0, cz: 0 }])
+  const first = await sampleTiles(world, 'overworld', [{ cx: 0, cz: 0 }, { cx: 40, cz: 40 }])
   assert.equal(first.aborted, false)
-  assert.equal(first.failed, 0)
-  assert.deepEqual(first.cx, [0])
-  assert.equal(first.rgb.length, 12)
-  assert.ok(first.rgb.some(byte => byte > 40))
+  assert.equal(CHUNK_TILE, 16)
+  assert.equal(first.rgb.length, 2 * CHUNK_TILE_BYTES)
+  assert.deepEqual(first.cx, [0, 40])
+  const grass = first.rgb.subarray(0, CHUNK_TILE_BYTES)
+  assert.ok(uniqueColors(grass) > 4)
+  assert.ok(grass.some(byte => byte > 40))
 
-  const again = await sampleOverview(world, 'overworld', [{ cx: 0, cz: 0 }])
-  assert.deepEqual(again.rgb, first.rgb)
+  const again = await sampleTiles(world, 'overworld', [{ cx: 0, cz: 0 }])
+  assert.deepEqual(again.rgb, grass)
 
-  const missing = await sampleOverview(world, 'overworld', [{ cx: 40, cz: 40 }])
-  assert.equal(missing.rgb.length, 12)
-  assert.equal(missing.failed, 0)
-
+  const pixel = (4 * 16 + 4) * 3
   world.setBlock('overworld', 4, 63, 4, 'stone')
-  const changed = await sampleOverview(world, 'overworld', [{ cx: 0, cz: 0 }])
-  assert.notDeepEqual(Buffer.from(changed.rgb.subarray(0, 3)), Buffer.from(first.rgb.subarray(0, 3)))
+  const changed = await sampleTiles(world, 'overworld', [{ cx: 0, cz: 0 }])
+  assert.equal(changed.rgb.length, CHUNK_TILE_BYTES)
+  assert.notDeepEqual(Buffer.from(changed.rgb.subarray(pixel, pixel + 3)), Buffer.from(grass.subarray(pixel, pixel + 3)))
   await world.close()
 })

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
-import { MAX_PIXELS_PER_BLOCK, MIN_PIXELS_PER_BLOCK, farPixelsPerBlock, sliderToZoom, viewLod, zoomToSlider } from './lod'
+import { DETAIL_CHUNK_BUDGET, MAX_PIXELS_PER_BLOCK, MIN_PIXELS_PER_BLOCK, farPixelsPerBlock, sliderToZoom, zoomToSlider } from './lod'
 import { paintSwatch } from './swatches'
 import {
   DEFAULT_OPTIONS,
@@ -44,13 +44,8 @@ const GAME_LABEL: Record<string, string> = {
 }
 
 type MapPhase = 'loading' | 'ready' | 'empty' | 'error'
-type MapBitmap = {
-  canvas: HTMLCanvasElement
-  width: number
-  height: number
-  originX: number
-  originZ: number
-}
+const TILE = 16
+const TILE_BYTES = TILE * TILE * 3
 
 export function App() {
   const [saves, setSaves] = useState<SaveListing[]>([])
@@ -71,13 +66,11 @@ export function App() {
   const [mapMessage, setMapMessage] = useState('Indexing regions…')
   const view = useRef({ originX: 0, originZ: 0, scale: 8 })
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const mapRef = useRef<MapBitmap | null>(null)
   const maskRef = useRef(new Map<string, Uint8Array>())
   const maskListRef = useRef<{ rx: number, rz: number, present: Uint8Array }[]>([])
-  const overviewRef = useRef(new Map<string, Uint8Array>())
+  const tilesRef = useRef(new Map<string, HTMLCanvasElement>())
   const spanRef = useRef<{ w: number, h: number } | null>(null)
   const minZoomRef = useRef(MIN_PIXELS_PER_BLOCK)
-  const overviewNoted = useRef(false)
   const applyScaleRef = useRef<(next: number) => void>(() => {})
   const drag = useRef<{ mode: 'pan' | 'point', index: number, sx: number, sy: number, ox: number, oz: number } | null>(null)
   const sampleSeq = useRef(0)
@@ -106,12 +99,10 @@ export function App() {
     regionsReady.current = false
     maskRef.current = new Map()
     maskListRef.current = []
-    overviewRef.current = new Map()
+    tilesRef.current = new Map()
     spanRef.current = null
-    overviewNoted.current = false
     minZoomRef.current = MIN_PIXELS_PER_BLOCK
     setMinZoom(MIN_PIXELS_PER_BLOCK)
-    mapRef.current = null
     pendingFocus.current = focusOf(payload.info, 'overworld')
     view.current.scale = 8
     setZoom(8)
@@ -199,7 +190,7 @@ export function App() {
       view.current.originZ = focus.z - canvas.clientHeight / view.current.scale / 2
     }
 
-    async function fillOverview(seq: number, passForce: boolean) {
+    async function fillTiles(seq: number, passForce: boolean) {
       if (regionsReady.current && maskRef.current.size === 0) {
         setMapPhase('empty')
         setMapMessage(emptyMessage(opened, dim))
@@ -207,12 +198,15 @@ export function App() {
         return
       }
       const occupied = occupiedInView(stage, view.current, maskRef.current)
-      const missing = occupied.filter(chunk => !overviewRef.current.has(overviewKey(dim, chunk.cx, chunk.cz)))
+      const missing = occupied.filter(chunk => !tilesRef.current.has(tileKey(dim, chunk.cx, chunk.cz)))
       if (missing.length === 0) {
         if (seq !== sampleSeq.current) return
         if (!regionsReady.current && occupied.length === 0) {
           setMapPhase('loading')
           setMapMessage('Indexing regions…')
+        } else if (occupied.length === 0 && jumpToTerrain()) {
+          void sampleRef.current()
+          return
         } else {
           setMapPhase('ready')
           setMapMessage('')
@@ -220,8 +214,10 @@ export function App() {
         paintRef.current()
         return
       }
+      const total = occupied.length
+      let done = total - missing.length
       setMapPhase('loading')
-      setMapMessage('Building overview…')
+      setMapMessage(`Rendering chunks ${done} / ${total}…`)
       paintRef.current()
       let live = true
       const off = window.mcpaths.onMapProgress(message => {
@@ -235,15 +231,14 @@ export function App() {
           const db = (b.cx - midCx) ** 2 + (b.cz - midCz) ** 2
           return da - db
         })
-        const total = occupied.length
-        let done = total - missing.length
         let first = passForce
-        for (let i = 0; i < missing.length; i += 48) {
+        let failed = 0
+        for (let i = 0; i < missing.length; i += DETAIL_CHUNK_BUDGET) {
           if (seq !== sampleSeq.current || !worldRef.current) return
-          setMapMessage(`Coloring ${done} / ${total} chunks…`)
-          const result = await window.mcpaths.overview({
+          setMapMessage(`Rendering chunks ${done} / ${total}…`)
+          const result = await window.mcpaths.tiles({
             dim,
-            chunks: missing.slice(i, i + 48),
+            chunks: missing.slice(i, i + DETAIL_CHUNK_BUDGET),
             force: first
           })
           first = false
@@ -251,35 +246,39 @@ export function App() {
           if (result.cancelled) return
           if (!result.ok || !result.data) {
             setMapPhase('error')
-            setMapMessage(result.error || 'The overview could not be colored.')
-            note(result.error || 'The overview could not be colored.', true)
+            setMapMessage(result.error || 'The map could not be read.')
+            note(result.error || 'The map could not be read.', true)
             paintRef.current()
             return
           }
           const cx = numberList(result.data.cx)
           const cz = numberList(result.data.cz)
           const rgb = bytesOf(result.data.rgb)
-          const count = Math.min(cx.length, cz.length, Math.floor(rgb.length / 12))
+          const count = Math.min(cx.length, cz.length, Math.floor(rgb.length / TILE_BYTES))
           for (let n = 0; n < count; n++) {
-            const copy = new Uint8Array(12)
-            copy.set(rgb.subarray(n * 12, n * 12 + 12))
-            overviewRef.current.set(overviewKey(dim, cx[n] ?? 0, cz[n] ?? 0), copy)
+            tilesRef.current.set(tileKey(dim, cx[n] ?? 0, cz[n] ?? 0), tileCanvas(rgb, n * TILE_BYTES))
           }
+          failed += result.data.failed || 0
           done += count
           paintRef.current()
-          setMapMessage(`Coloring ${Math.min(done, total)} / ${total} chunks…`)
+          setMapMessage(`Rendering chunks ${Math.min(done, total)} / ${total}…`)
+          await new Promise<void>(resolve => { window.setTimeout(resolve, 0) })
+          if (seq !== sampleSeq.current || !worldRef.current) return
         }
         if (seq !== sampleSeq.current) return
         live = false
+        if (failed > 0 && done === 0) {
+          setMapPhase('error')
+          setMapMessage('Region files could not be read.')
+          note('Region files could not be read.', true)
+          return
+        }
         setMapPhase('ready')
         setMapMessage('')
-        if (done > 0 && !overviewNoted.current) {
-          overviewNoted.current = true
-          note('Far view uses terrain colors. Zoom in for block detail.')
-        }
+        if (failed > 0) note(`${failed} chunk${failed === 1 ? '' : 's'} could not be read.`, true)
       } catch (error) {
         if (seq !== sampleSeq.current || !worldRef.current) return
-        const message = error instanceof Error ? error.message : 'The overview could not be colored.'
+        const message = error instanceof Error ? error.message : 'The map could not be read.'
         setMapPhase('error')
         setMapMessage(message)
         note(message, true)
@@ -290,90 +289,9 @@ export function App() {
     }
 
     const seq = ++sampleSeq.current
-    if (force) overviewRef.current.clear()
-    const scale = view.current.scale
-    const blocksW = Math.ceil(canvas.clientWidth / scale) + 1
-    const blocksH = Math.ceil(canvas.clientHeight / scale) + 1
-    const across = Math.ceil(canvas.clientWidth / scale / 16)
-    const down = Math.ceil(canvas.clientHeight / scale / 16)
-    if (viewLod(across, down) === 'overview') {
-      paintRef.current()
-      await fillOverview(seq, force)
-      return
-    }
-    setMapPhase('loading')
-    setMapMessage('Reading terrain…')
-    const off = window.mcpaths.onMapProgress(message => {
-      if (seq === sampleSeq.current) setMapMessage(message)
-    })
-    try {
-      const result = await window.mcpaths.sample({
-        dim,
-        originX: Math.floor(view.current.originX),
-        originZ: Math.floor(view.current.originZ),
-        width: blocksW,
-        height: blocksH,
-        force
-      })
-      if (seq !== sampleSeq.current || !worldRef.current) return
-      if (result.cancelled) return
-      if (!result.ok || !result.data) {
-        mapRef.current = null
-        setMapPhase('error')
-        setMapMessage(result.error || 'The map could not be read.')
-        note(result.error || 'The map could not be read.', true)
-        paintRef.current()
-        return
-      }
-      const rgb = bytesOf(result.data.rgb)
-      const present = bytesOf(result.data.present)
-      mapRef.current = {
-        canvas: bitmapOf(rgb, present, result.data.width, result.data.height),
-        width: result.data.width,
-        height: result.data.height,
-        originX: result.data.originX,
-        originZ: result.data.originZ
-      }
-      paintRef.current()
-      if (result.data.failed > 0 && result.data.chunks === 0) {
-        setMapPhase('error')
-        setMapMessage(result.data.warning || 'Region files could not be read.')
-        note(result.data.warning || 'Region files could not be read.', true)
-        return
-      }
-      if (result.data.chunks === 0 && result.data.failed === 0) {
-        if (jumpToTerrain()) {
-          void sampleRef.current()
-          return
-        }
-        if (!regionsReady.current) {
-          setMapPhase('loading')
-          setMapMessage('Indexing regions…')
-          return
-        }
-        if (maskRef.current.size === 0) {
-          setMapPhase('empty')
-          setMapMessage(emptyMessage(current, dim))
-          return
-        }
-        setMapPhase('ready')
-        setMapMessage('No colored chunks in this view. Pan, or zoom out to see explored terrain.')
-        return
-      }
-      setMapPhase('ready')
-      setMapMessage(result.data.warning || '')
-      if (result.data.warning) note(result.data.warning, result.data.failed > 0)
-    } catch (error) {
-      if (seq !== sampleSeq.current || !worldRef.current) return
-      const message = error instanceof Error ? error.message : 'The map could not be read.'
-      mapRef.current = null
-      setMapPhase('error')
-      setMapMessage(message)
-      note(message, true)
-      paintRef.current()
-    } finally {
-      off()
-    }
+    if (force) tilesRef.current.clear()
+    paintRef.current()
+    await fillTiles(seq, force)
   }, [dim, jumpToTerrain])
 
   sampleRef.current = sample
@@ -395,18 +313,7 @@ export function App() {
     const scale = view.current.scale
     const originX = view.current.originX
     const originZ = view.current.originZ
-    drawTerrain(ctx, cssW, cssH, originX, originZ, scale, maskRef.current, overviewRef.current, dim)
-    const map = mapRef.current
-    if (map) {
-      ctx.imageSmoothingEnabled = false
-      ctx.drawImage(
-        map.canvas,
-        (map.originX - originX) * scale,
-        (map.originZ - originZ) * scale,
-        map.width * scale,
-        map.height * scale
-      )
-    }
+    drawTerrain(ctx, cssW, cssH, originX, originZ, scale, maskRef.current, tilesRef.current, dim)
     if (16 * scale >= 8) strokeGrid(ctx, cssW, cssH, originX, originZ, scale, 16, 'rgba(232, 238, 246, 0.16)', 1)
     if (512 * scale >= 16) strokeGrid(ctx, cssW, cssH, originX, originZ, scale, 512, 'rgba(232, 238, 246, 0.28)', 1)
     const current = worldRef.current
@@ -463,12 +370,11 @@ export function App() {
       setZoom(scale)
     }
     pendingFocus.current = focusOf(world.info, dim)
-    overviewRef.current = new Map()
+    tilesRef.current = new Map()
     spanRef.current = null
     maskRef.current = new Map()
     maskListRef.current = []
     regionsReady.current = false
-    mapRef.current = null
     recentered.current = false
     if (canvas && canvas.clientWidth >= 8 && pendingFocus.current) {
       const focus = pendingFocus.current
@@ -507,10 +413,10 @@ export function App() {
       refreshMinZoom()
       paintRef.current()
       if (jumpToTerrain()) void sampleRef.current()
-      else if (list.length === 0 && mapRef.current == null && overviewRef.current.size === 0) {
+      else if (list.length === 0 && tilesRef.current.size === 0) {
         setMapPhase('empty')
         setMapMessage(emptyMessage(world, dim))
-      } else if (canvasIsOverview()) void sampleRef.current()
+      } else void sampleRef.current()
     }).catch((error: unknown) => {
       if (cancel) return
       regionsReady.current = true
@@ -620,14 +526,6 @@ export function App() {
       view.current.scale = next
       setZoom(next)
     }
-  }
-
-  function canvasIsOverview(): boolean {
-    const canvas = canvasRef.current
-    if (!canvas || canvas.clientWidth < 8) return false
-    const across = Math.ceil(canvas.clientWidth / view.current.scale / 16)
-    const down = Math.ceil(canvas.clientHeight / view.current.scale / 16)
-    return viewLod(across, down) === 'overview'
   }
 
   function toBlock(event: { clientX: number, clientY: number }): XZ {
@@ -817,8 +715,7 @@ export function App() {
   function leaveWorld() {
     sampleSeq.current++
     worldRef.current = null
-    mapRef.current = null
-    overviewRef.current = new Map()
+    tilesRef.current = new Map()
     spanRef.current = null
     setWorld(null)
     note(saves.length ? 'Pick a save, or open a folder.' : 'No saves in the usual folders.')
@@ -1136,23 +1033,22 @@ function bytesOf(value: unknown): Uint8Array {
   return new Uint8Array()
 }
 
-function bitmapOf(rgb: Uint8Array, present: Uint8Array, width: number, height: number): HTMLCanvasElement {
+function tileCanvas(rgb: Uint8Array, offset: number): HTMLCanvasElement {
   const off = document.createElement('canvas')
-  off.width = Math.max(1, width)
-  off.height = Math.max(1, height)
+  off.width = TILE
+  off.height = TILE
   const ctx = off.getContext('2d')
-  if (!ctx || width < 1 || height < 1) return off
-  const pixels = new Uint8ClampedArray(width * height * 4)
-  const count = Math.min(width * height, present.length, Math.floor(rgb.length / 3))
-  for (let p = 0; p < count; p++) {
-    const i = p * 3
+  if (!ctx) return off
+  const pixels = new Uint8ClampedArray(TILE * TILE * 4)
+  for (let p = 0; p < TILE * TILE; p++) {
+    const i = offset + p * 3
     const j = p * 4
     pixels[j] = rgb[i] ?? 0
     pixels[j + 1] = rgb[i + 1] ?? 0
     pixels[j + 2] = rgb[i + 2] ?? 0
-    pixels[j + 3] = present[p] ? 255 : 0
+    pixels[j + 3] = 255
   }
-  const image = ctx.createImageData(width, height)
+  const image = ctx.createImageData(TILE, TILE)
   image.data.set(pixels)
   ctx.putImageData(image, 0, 0)
   return off
@@ -1260,7 +1156,7 @@ function nearestChunk(masks: { rx: number, rz: number, present: Uint8Array }[], 
   return best
 }
 
-function overviewKey(dim: string, cx: number, cz: number): string {
+function tileKey(dim: string, cx: number, cz: number): string {
   return `${dim}:${cx},${cz}`
 }
 
@@ -1317,23 +1213,6 @@ function occupiedInView(
   return chunks
 }
 
-function cssAt(tex: Uint8Array, quad: number): string {
-  const i = quad * 3
-  return `rgb(${tex[i] ?? 0},${tex[i + 1] ?? 0},${tex[i + 2] ?? 0})`
-}
-
-function averageCss(tex: Uint8Array): string {
-  let r = 0
-  let g = 0
-  let b = 0
-  for (let i = 0; i < 12; i += 3) {
-    r += tex[i] ?? 0
-    g += tex[i + 1] ?? 0
-    b += tex[i + 2] ?? 0
-  }
-  return `rgb(${r >> 2},${g >> 2},${b >> 2})`
-}
-
 function drawTerrain(
   ctx: CanvasRenderingContext2D,
   cssW: number,
@@ -1342,7 +1221,7 @@ function drawTerrain(
   originZ: number,
   scale: number,
   masks: Map<string, Uint8Array>,
-  colors: Map<string, Uint8Array>,
+  tiles: Map<string, HTMLCanvasElement>,
   dim: string
 ) {
   if (masks.size === 0) return
@@ -1357,7 +1236,7 @@ function drawTerrain(
   const r0z = Math.floor(c0z / 32)
   const r1z = Math.floor(c1z / 32)
   const chunkPx = 16 * scale
-  const fine = chunkPx >= 3
+  ctx.imageSmoothingEnabled = false
   for (let rz = r0z; rz <= r1z; rz++) {
     for (let rx = r0x; rx <= r1x; rx++) {
       const present = masks.get(`${rx},${rz}`)
@@ -1373,26 +1252,14 @@ function drawTerrain(
           const cz = rz * 32 + lz
           const sx = (cx * 16 - originX) * scale
           const sz = (cz * 16 - originZ) * scale
-          const tex = colors.get(overviewKey(dim, cx, cz))
-          if (!tex || tex.length < 12) {
+          const tile = tiles.get(tileKey(dim, cx, cz))
+          if (!tile) {
             ctx.fillStyle = '#24382f'
-            ctx.fillRect(sx, sz, Math.max(chunkPx, 1), Math.max(chunkPx, 1))
+            ctx.fillRect(sx, sz, chunkPx, chunkPx)
             continue
           }
-          if (!fine) {
-            ctx.fillStyle = averageCss(tex)
-            ctx.fillRect(sx, sz, Math.max(chunkPx, 1), Math.max(chunkPx, 1))
-            continue
-          }
-          const half = chunkPx / 2
-          ctx.fillStyle = cssAt(tex, 0)
-          ctx.fillRect(sx, sz, half, half)
-          ctx.fillStyle = cssAt(tex, 1)
-          ctx.fillRect(sx + half, sz, half, half)
-          ctx.fillStyle = cssAt(tex, 2)
-          ctx.fillRect(sx, sz + half, half, half)
-          ctx.fillStyle = cssAt(tex, 3)
-          ctx.fillRect(sx + half, sz + half, half, half)
+          ctx.imageSmoothingEnabled = false
+          ctx.drawImage(tile, sx, sz, chunkPx, chunkPx)
         }
       }
     }

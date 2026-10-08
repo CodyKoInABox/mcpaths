@@ -12,10 +12,9 @@ export {
 export type { Dimension, VersionSupport, PaletteSchema } from './versions'
 export { World, createWorld, readWorldInfo, readStoredChunk, regionDirectory, occupiedBounds, regionMasks } from './world'
 export type { WorldInfo, BlockState, RegionMask, LoadHooks } from './world'
-export { sampleMap, renderSurface, sampleOverview, overviewFromSurface, overviewTexels, OVERVIEW_COLUMNS } from './map'
-export type { MapSample, OverviewSample } from './map'
+export { sampleMap, renderSurface, sampleTiles, CHUNK_TILE, CHUNK_TILE_BYTES } from './map'
+export type { MapSample, ChunkTiles } from './map'
 export {
-  viewLod,
   farPixelsPerBlock,
   zoomToSlider,
   sliderToZoom,
@@ -23,7 +22,6 @@ export {
   MIN_PIXELS_PER_BLOCK,
   MAX_PIXELS_PER_BLOCK
 } from './lod'
-export type { ViewLod } from './lod'
 export { listSaves, candidateSaveRoots, saveSearchPaths, describeSave } from './saves'
 export type { SaveListing, SaveRoot } from './saves'
 export { gridAddress, regionOf } from './grid'

@@ -94,43 +94,21 @@ export function renderSurface(column: any): Uint8Array {
   return rgb
 }
 
-/** Four columns per chunk: center of each 8×8 quadrant. 12 RGB bytes. */
-export const OVERVIEW_COLUMNS: readonly [number, number][] = [[4, 4], [12, 4], [4, 12], [12, 12]]
+/** One texel per block column. Same buffer renderSurface writes. */
+export const CHUNK_TILE = 16
+export const CHUNK_TILE_BYTES = CHUNK_TILE * CHUNK_TILE * 3
 
-export interface OverviewSample {
+export interface ChunkTiles {
   cx: number[]
   cz: number[]
+  /** RGB, CHUNK_TILE_BYTES per chunk, same order as cx/cz. */
   rgb: Uint8Array
   failed: number
   aborted?: boolean
 }
 
-export function overviewFromSurface(tile: Uint8Array): Uint8Array {
-  const out = new Uint8Array(OVERVIEW_COLUMNS.length * 3)
-  let n = 0
-  for (const [lx, lz] of OVERVIEW_COLUMNS) {
-    const i = (lz * 16 + lx) * 3
-    out[n++] = tile[i] ?? 0
-    out[n++] = tile[i + 1] ?? 0
-    out[n++] = tile[i + 2] ?? 0
-  }
-  return out
-}
-
-export function overviewTexels(column: any): Uint8Array {
-  const out = new Uint8Array(OVERVIEW_COLUMNS.length * 3)
-  let n = 0
-  for (const [lx, lz] of OVERVIEW_COLUMNS) {
-    const color = columnColor(column, lx, lz)
-    out[n++] = color[0]
-    out[n++] = color[1]
-    out[n++] = color[2]
-  }
-  return out
-}
-
-function solidTex(r: number, g: number, b: number): Uint8Array {
-  const out = new Uint8Array(OVERVIEW_COLUMNS.length * 3)
+function solidTile(r: number, g: number, b: number): Uint8Array {
+  const out = new Uint8Array(CHUNK_TILE_BYTES)
   for (let i = 0; i < out.length; i += 3) {
     out[i] = r
     out[i + 1] = g
@@ -236,13 +214,13 @@ export async function sampleMap(
   return { originX, originZ, width, height, rgb, present, chunks, failed, truncated, warning, aborted: false }
 }
 
-/** Sparse terrain colors for a far view. Four columns per chunk, cached on the world. One bad chunk stays red. */
-export async function sampleOverview(
+/** Full-resolution chunk images. One sample per block column, cached on the world. A bad chunk is red and does not drop the rest. */
+export async function sampleTiles(
   world: World,
   dim: Dimension,
   chunks: { cx: number, cz: number }[],
   hooks?: LoadHooks
-): Promise<OverviewSample> {
+): Promise<ChunkTiles> {
   const ordered = chunks.slice().sort((a, b) => {
     const ar = regionOf(a.cx, a.cz)
     const br = regionOf(b.cx, b.cz)
@@ -250,14 +228,13 @@ export async function sampleOverview(
   })
   const missing: { cx: number, cz: number }[] = []
   for (const chunk of ordered) {
-    if (world.cachedOverview(dim, chunk.cx, chunk.cz)) continue
     if (world.chunkError(dim, chunk.cx, chunk.cz)) continue
     if (world.cachedSurface(dim, chunk.cx, chunk.cz)) continue
     if (world.columnOf(dim, chunk.cx, chunk.cz)) continue
     missing.push(chunk)
   }
   if (missing.length) {
-    hooks?.progress?.('Building overview…')
+    hooks?.progress?.('Rendering chunks…')
     await world.preloadChunks(dim, missing, hooks)
   }
   if (hooks?.cancelled?.()) {
@@ -265,35 +242,31 @@ export async function sampleOverview(
   }
   const cx: number[] = []
   const cz: number[] = []
-  const rgb = new Uint8Array(ordered.length * OVERVIEW_COLUMNS.length * 3)
+  const rgb = new Uint8Array(ordered.length * CHUNK_TILE_BYTES)
   let failed = 0
   let colored = 0
   for (const chunk of ordered) {
     if (hooks?.cancelled?.()) {
-      return { cx, cz, rgb: rgb.subarray(0, cx.length * 12), failed, aborted: true }
+      return { cx, cz, rgb: rgb.subarray(0, cx.length * CHUNK_TILE_BYTES), failed, aborted: true }
     }
-    let tex = world.cachedOverview(dim, chunk.cx, chunk.cz)
-    if (!tex) {
+    let tile = world.cachedSurface(dim, chunk.cx, chunk.cz)
+    if (!tile) {
       const error = world.chunkError(dim, chunk.cx, chunk.cz)
       if (error) {
         failed++
-        tex = solidTex(140, 72, 72)
+        tile = solidTile(140, 72, 72)
       } else {
-        const surface = world.cachedSurface(dim, chunk.cx, chunk.cz)
-        if (surface) tex = overviewFromSurface(surface)
-        else {
-          const column = world.columnOf(dim, chunk.cx, chunk.cz)
-          tex = column ? overviewTexels(column) : solidTex(VOID_COLOR[0], VOID_COLOR[1], VOID_COLOR[2])
-        }
+        const column = world.columnOf(dim, chunk.cx, chunk.cz)
+        tile = column ? renderSurface(column) : solidTile(VOID_COLOR[0], VOID_COLOR[1], VOID_COLOR[2])
       }
-      world.cacheOverview(dim, chunk.cx, chunk.cz, tex)
+      world.cacheSurface(dim, chunk.cx, chunk.cz, tile)
     }
-    const offset = cx.length * 12
+    const offset = cx.length * CHUNK_TILE_BYTES
     cx.push(chunk.cx)
     cz.push(chunk.cz)
-    rgb.set(tex, offset)
+    rgb.set(tile.subarray(0, CHUNK_TILE_BYTES), offset)
     colored++
-    if (colored % 24 === 0) hooks?.progress?.(`Coloring ${colored} chunks…`)
+    if (colored % 16 === 0) hooks?.progress?.(`Rendering chunks ${colored}…`)
   }
-  return { cx, cz, rgb: rgb.subarray(0, cx.length * 12), failed, aborted: false }
+  return { cx, cz, rgb: rgb.subarray(0, cx.length * CHUNK_TILE_BYTES), failed, aborted: false }
 }

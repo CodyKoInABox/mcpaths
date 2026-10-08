@@ -258,7 +258,6 @@ export class World {
   private regions = new Map<string, any>()
   private chunks = new Map<string, EditableChunk>()
   private surfaces = new Map<string, Uint8Array>()
-  private overviews = new Map<string, Uint8Array>()
   private failures = new Map<string, string>()
 
   private constructor(info: WorldInfo) {
@@ -282,13 +281,11 @@ export class World {
     this.regions.clear()
     this.chunks.clear()
     this.surfaces.clear()
-    this.overviews.clear()
     this.failures.clear()
   }
 
   clearMapCache() {
     this.surfaces.clear()
-    this.overviews.clear()
     this.failures.clear()
   }
 
@@ -302,14 +299,6 @@ export class World {
 
   cacheSurface(dim: Dimension, cx: number, cz: number, rgb: Uint8Array) {
     this.surfaces.set(chunkKey(dim, cx, cz), rgb)
-  }
-
-  cachedOverview(dim: Dimension, cx: number, cz: number): Uint8Array | null {
-    return this.overviews.get(chunkKey(dim, cx, cz)) ?? null
-  }
-
-  cacheOverview(dim: Dimension, cx: number, cz: number, rgb: Uint8Array) {
-    this.overviews.set(chunkKey(dim, cx, cz), rgb)
   }
 
   chunkError(dim: Dimension, cx: number, cz: number): string | null {
@@ -458,7 +447,6 @@ export class World {
     chunk.dirty = true
     chunk.touched.add(Math.floor(y / 16))
     this.surfaces.delete(chunkKey(dim, cx, cz))
-    this.overviews.delete(chunkKey(dim, cx, cz))
   }
 
   setBiome(dim: Dimension, x: number, y: number, z: number, biome: string) {

@@ -7,7 +7,7 @@ contextBridge.exposeInMainWorld('mcpaths', {
   bounds: (dim) => ipcRenderer.invoke('bounds', dim),
   regions: (dim) => ipcRenderer.invoke('regions', dim),
   sample: (query) => ipcRenderer.invoke('sample', query),
-  overview: (query) => ipcRenderer.invoke('overview', query),
+  tiles: (query) => ipcRenderer.invoke('tiles', query),
   preview: (query) => ipcRenderer.invoke('preview', query),
   apply: (query) => ipcRenderer.invoke('apply', query),
   onOpened: (handler) => {

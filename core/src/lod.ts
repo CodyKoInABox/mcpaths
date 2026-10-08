@@ -3,15 +3,6 @@ export const MAX_PIXELS_PER_BLOCK = 32
 /** Farthest zoom. A 1000px-wide view still covers 250,000 blocks. */
 export const MIN_PIXELS_PER_BLOCK = 0.004
 
-export type ViewLod = 'detail' | 'overview'
-
-/** Detail block colors while the view is small. Overview once it covers more chunks than the budget. */
-export function viewLod(chunksAcross: number, chunksDown: number, budget = DETAIL_CHUNK_BUDGET): ViewLod {
-  if (!Number.isFinite(chunksAcross) || !Number.isFinite(chunksDown)) return 'detail'
-  if (chunksAcross < 1 || chunksDown < 1) return 'detail'
-  return chunksAcross * chunksDown > budget ? 'overview' : 'detail'
-}
-
 /**
  * Smallest pixels-per-block that fits the explored area, plus margin.
  * A small world can still zoom out until about 4096 blocks fit on the short side,

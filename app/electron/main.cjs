@@ -171,7 +171,7 @@ ipcMain.handle('sample', async (event, query) => {
   })
 })
 
-ipcMain.handle('overview', async (event, query) => {
+ipcMain.handle('tiles', async (event, query) => {
   const token = ++mapToken
   if (!world) return { ok: false, error: 'No world is open.' }
   const chunks = Array.isArray(query?.chunks) ? query.chunks : []
@@ -179,7 +179,7 @@ ipcMain.handle('overview', async (event, query) => {
     if (!world || token !== mapToken) return { ok: false, cancelled: true }
     try {
       if (query.force) world.clearMapCache()
-      const map = await core.sampleOverview(world, query.dim, chunks, {
+      const map = await core.sampleTiles(world, query.dim, chunks, {
         progress: message => {
           if (token === mapToken) event.sender.send('map-progress', message)
         },
