@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MC Paths</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="top">
+      <strong>MC Paths</strong>
+      <a href="https://github.com/CodyKoInABox/mcpaths/releases">Windows download</a>
+    </header>
+    <main>
+      <section class="hero">
+        <div>
+          <p class="kicker">Minecraft Java, on the save itself</p>
+          <h1>Draw a path. Leave the rest of the world alone.</h1>
+          <p class="lede">
+            MC Paths is a desktop map for Java Edition. You sketch a line over the world, pick a preset, and the app writes that path into the region files. A copy of every region it touches is stored in the save before anything is changed.
+          </p>
+          <p class="actions">
+            <a class="copper" href="https://github.com/CodyKoInABox/mcpaths/releases">Get the Windows installer</a>
+            <a class="ghost" href="https://github.com/CodyKoInABox/mcpaths">Source</a>
+          </p>
+        </div>
+        <figure>
+          <img src="ui.png" alt="MC Paths editor: top-down grass map, a finished trail, and the preset panel" />
+          <figcaption>Overworld map, a finished trail, and the preset panel.</figcaption>
+        </figure>
+      </section>
+
+      <section>
+        <h2>How to use</h2>
+        <ol class="steps">
+          <li>
+            <span>1</span>
+            <div>
+              <h3>Open a save</h3>
+              <p>Pick a world from the Minecraft saves folder, or open any folder that contains <code>level.dat</code>.</p>
+            </div>
+          </li>
+          <li>
+            <span>2</span>
+            <div>
+              <h3>Draw the line</h3>
+              <p>Click points on the map, drag a point to move it, Backspace to undo. Enter finishes the spline.</p>
+            </div>
+          </li>
+          <li>
+            <span>3</span>
+            <div>
+              <h3>Pick a preset</h3>
+              <p>Width, hills, water, and dressing sit next to the map. The preview updates before anything is written.</p>
+            </div>
+          </li>
+          <li>
+            <span>4</span>
+            <div>
+              <h3>Apply</h3>
+              <p>Touched <code>.mca</code> files are copied into <code>.mcpaths-backup</code>, then the path is written. Open the save in Minecraft.</p>
+            </div>
+          </li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Presets</h2>
+        <ul class="presets">
+          <li><strong>Trail</strong> Dirt path, with coarse dirt along the edge.</li>
+          <li><strong>Cobble road</strong> Cobblestone center, stone brick border, gravel shoulder.</li>
+          <li><strong>Moss walk</strong> Moss block, mossy cobble in the middle, rooted dirt at the edge.</li>
+          <li><strong>Sandstone way</strong> Smooth sandstone with a cut sandstone border.</li>
+          <li><strong>Adaptive</strong> Follows the biome: desert, badlands, swamp, snow, forest, peaks. Otherwise Trail.</li>
+          <li><strong>Boardwalk</strong> Planks and slabs. Wood follows the biome, spruce when nothing else matches.</li>
+        </ul>
+        <p class="fine">Default is Trail, Normal width (5), Follow hills, Bridge water, Subtle dressing. Narrow is 3 blocks, Wide is 7. Tunnel carves instead of following the slope. Causeway fills water instead of spanning it.</p>
+      </section>
+
+      <section class="note">
+        <h2>Versions</h2>
+        <p>Java 1.18 through the latest 1.21.x that minecraft-data knows, plus 26.1, 26.2 (DataVersion 4903), and 26.3 (DataVersion 5023). Worlds before 1.18, and 26.4 or newer, are refused.</p>
+        <p>Section bit-packing is unchanged through 26.3, so chunks are read with prismarine’s 1.21 palette codec. The save keeps its own DataVersion. 26.2 stays 4903 and 26.3 stays 5023. The 1.21 value 4671 is never written back.</p>
+      </section>
+    </main>
+    <footer>
+      <span>GPL-3.0-only</span>
+      <span>No Mojang textures or sounds.</span>
+    </footer>
+  </body>
+</html>

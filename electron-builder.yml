@@ -1,0 +1,26 @@
+appId: com.mcpaths.app
+productName: MC Paths
+executableName: MC Paths
+directories:
+  output: release
+  # The workspace package lives in app/. Without this, electron-builder treats
+  # that folder as a two-package app and drops core/ plus the repo-root main.
+  app: "."
+files:
+  - package.json
+  - app/dist/**/*
+  - app/electron/**/*
+  - app/package.json
+  - core/dist/**/*
+  - core/package.json
+  - "!**/*.map"
+asar: true
+npmRebuild: false
+win:
+  target: nsis
+  signAndEditExecutable: false
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  artifactName: MC-Paths-Setup-${version}.${ext}

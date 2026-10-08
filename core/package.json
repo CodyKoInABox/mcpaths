@@ -1,0 +1,25 @@
+{
+  "name": "@mcpaths/core",
+  "version": "0.1.0",
+  "private": true,
+  "license": "GPL-3.0-only",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.json --noEmit && node --import tsx --test test/roundtrip.test.ts test/path.test.ts test/versions.test.ts"
+  },
+  "dependencies": {
+    "minecraft-data": "3.117.0",
+    "prismarine-block": "1.23.0",
+    "prismarine-chunk": "1.41.0",
+    "prismarine-nbt": "2.8.0",
+    "prismarine-provider-anvil": "2.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.2"
+  }
+}
