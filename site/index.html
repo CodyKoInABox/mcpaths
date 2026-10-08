@@ -67,14 +67,14 @@
       <section>
         <h2>Presets</h2>
         <ul class="presets">
-          <li><strong>Trail</strong> Dirt path, with coarse dirt along the edge.</li>
+          <li><strong>Trail</strong> Dirt path down the middle, coarse dirt and rooted dirt beside it.</li>
           <li><strong>Cobble road</strong> Cobblestone center, stone brick border, gravel shoulder.</li>
-          <li><strong>Moss walk</strong> Moss block, mossy cobble in the middle, rooted dirt at the edge.</li>
-          <li><strong>Sandstone way</strong> Smooth sandstone with a cut sandstone border.</li>
-          <li><strong>Adaptive</strong> Follows the biome: desert, badlands, swamp, snow, forest, peaks. Otherwise Trail.</li>
-          <li><strong>Boardwalk</strong> Planks and slabs. Wood follows the biome, spruce when nothing else matches.</li>
+          <li><strong>Moss walk</strong> Moss block with rooted dirt edges. The center is sometimes mossy cobble.</li>
+          <li><strong>Sandstone way</strong> Smooth sandstone, cut sandstone border, sand shoulders. No plants or posts.</li>
+          <li><strong>Adaptive</strong> Materials from the biome under the first point only. Desert, badlands, forest, jungle, peaks, snow, swamp, and mangrove each have a set. Everywhere else is a trail.</li>
+          <li><strong>Boardwalk</strong> Planks, slabs, and fences. Wood comes from the biome under the first point, spruce when that biome names no tree.</li>
         </ul>
-        <p class="fine">Default is Trail, Normal width (5), Follow hills, Bridge water, Subtle dressing. Narrow is 3 blocks, Wide is 7. Tunnel carves instead of following the slope. Causeway fills water instead of spanning it.</p>
+        <p class="fine">Default is Trail, Normal width (5), Follow hills, Bridge water, Subtle dressing. Narrow is 3 blocks, Wide is 7. Tunnel carves a level passage and skips water, so bridge, causeway, and dressing do not apply. Causeway fills water instead of spanning it. Past 128 chunks in view the map is an overview until you zoom in.</p>
       </section>
 
       <section class="note">

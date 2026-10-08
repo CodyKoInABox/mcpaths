@@ -9,11 +9,17 @@ import {
   DATA_VERSION_26_3,
   DEFAULT_OPTIONS,
   applyPaths,
+  corridorChunks,
   createWorld,
+  dimensionBounds,
+  planPaths,
+  previewPaths,
   readStoredChunk,
   sampleMap,
   type PresetId
 } from '../src'
+import type { ColumnView } from '../src/path/generate'
+import { resample } from '../src/path/spline'
 import { buildFixture } from './fixture'
 
 async function flatWorld(dataVersion: number) {
@@ -140,6 +146,45 @@ test('follow changes a hill, tunnel carves, bridge spans, causeway fills', async
   await cause.world.close()
 })
 
+test('boardwalk keeps fences when dressing is off', async () => {
+  const flat = await flatWorld(DATA_VERSION_26_2)
+  await applyPaths(flat.world, 'overworld', [{
+    name: 'planks',
+    points: [{ x: 2, z: 8 }, { x: 13, z: 8 }],
+    preset: 'boardwalk',
+    options: { ...DEFAULT_OPTIONS, dressing: 'off' }
+  }])
+  let fences = 0
+  for (let z = 0; z < 16; z++) {
+    for (let x = 0; x < 16; x++) {
+      if (flat.world.getBlock('overworld', x, 64, z).name === 'spruce_fence') fences++
+    }
+  }
+  assert.ok(fences > 0, 'boardwalk fences are part of the preset, not dressing')
+  await flat.world.close()
+})
+
+test('corridor follows the spline instead of the control-point rectangle', () => {
+  const points = [{ x: 0, z: 0 }, { x: 1000, z: 1000 }]
+  const chunks = corridorChunks([{
+    name: 'diagonal',
+    points,
+    preset: 'trail',
+    options: { ...DEFAULT_OPTIONS, width: 'wide' }
+  }])
+  const keys = new Set(chunks.map(chunk => `${chunk.cx},${chunk.cz}`))
+  assert.ok(keys.has('0,0'))
+  assert.ok(keys.has('62,62'))
+  assert.equal(keys.has('0,60'), false)
+  const box = 63 * 63
+  assert.ok(chunks.length < box / 5, `corridor ${chunks.length} should be far under the ${box} bounding box`)
+  for (const sample of resample(points)) {
+    const cx = Math.floor(sample.x / 16)
+    const cz = Math.floor(sample.z / 16)
+    assert.ok(keys.has(`${cx},${cz}`), `${cx},${cz}`)
+  }
+})
+
 test('adaptive desert uses sandstone and backup restores the region', async () => {
   const { dir, world } = await buildFixture(DATA_VERSION_26_2)
   for (let z = 0; z < 16; z++) {
@@ -164,4 +209,128 @@ test('adaptive desert uses sandstone and backup restores the region', async () =
   assert.equal(restored.getBlock('overworld', 7, 64, 9).name, 'grass_block')
   assert.deepEqual(await fs.readFile(region), before)
   await restored.close()
+})
+
+const BOUNDS = dimensionBounds('overworld')
+
+function grassView(): ColumnView {
+  return {
+    get(_x, y) {
+      if (y === 63) return { name: 'grass_block' }
+      if (y >= 1 && y <= 62) return { name: 'dirt' }
+      if (y === 0) return { name: 'bedrock' }
+      return { name: 'air' }
+    },
+    biome() { return 'plains' },
+    protected() { return false },
+    ground() { return { y: 63, name: 'grass_block' } }
+  }
+}
+
+function lakeView(): ColumnView {
+  return {
+    get(_x, y) {
+      if (y >= 58 && y <= 62) return { name: 'water' }
+      if (y >= 1 && y <= 57) return { name: 'stone' }
+      if (y === 0) return { name: 'bedrock' }
+      return { name: 'air' }
+    },
+    biome() { return 'plains' },
+    protected() { return false },
+    ground() { return { y: 62, name: 'water' } }
+  }
+}
+
+function shoreView(): ColumnView {
+  return {
+    get(_x, y, z) {
+      if (z >= 8) {
+        if (y >= 58 && y <= 62) return { name: 'water' }
+        if (y >= 1 && y <= 57) return { name: 'stone' }
+        return { name: 'air' }
+      }
+      if (y === 63) return { name: 'grass_block' }
+      if (y >= 1 && y <= 62) return { name: 'stone' }
+      return { name: 'air' }
+    },
+    biome() { return 'plains' },
+    protected() { return false },
+    ground(_x, z) {
+      return z >= 8 ? { y: 62, name: 'water' } : { y: 63, name: 'grass_block' }
+    }
+  }
+}
+
+test('tunnel does not enter water', async () => {
+  const cells = await planPaths(shoreView(), [{
+    name: 'bore',
+    points: [{ x: 0, z: 2 }, { x: 0, z: 14 }],
+    preset: 'cobble',
+    options: { ...DEFAULT_OPTIONS, hills: 'tunnel', water: 'causeway', dressing: 'lined' }
+  }], BOUNDS)
+  assert.equal(cells.some(cell => cell.z >= 8), false)
+  assert.ok(cells.some(cell => cell.z < 8 && cell.name === 'air'))
+  assert.ok(cells.some(cell => cell.name === 'stone_bricks'))
+})
+
+test('dressing stays plants and posts, including over water', async () => {
+  const water = [{ x: 0, z: 8 }, { x: 40, z: 8 }]
+  const board = await planPaths(lakeView(), [{
+    name: 'planks',
+    points: water,
+    preset: 'boardwalk',
+    options: { ...DEFAULT_OPTIONS, dressing: 'off', water: 'bridge' }
+  }], BOUNDS)
+  assert.ok(board.some(cell => cell.name === 'spruce_fence' && cell.y === 64))
+
+  const bare = await planPaths(lakeView(), [{
+    name: 'road',
+    points: water,
+    preset: 'cobble',
+    options: { ...DEFAULT_OPTIONS, dressing: 'off', water: 'bridge' }
+  }], BOUNDS)
+  assert.equal(bare.some(cell => cell.name === 'oak_fence' || cell.name === 'lantern'), false)
+
+  const posted = await planPaths(lakeView(), [{
+    name: 'road',
+    points: water,
+    preset: 'cobble',
+    options: { ...DEFAULT_OPTIONS, dressing: 'subtle', water: 'bridge' }
+  }], BOUNDS)
+  const fences = posted.filter(cell => cell.name === 'oak_fence')
+  const deck = posted.filter(cell => cell.y === 63)
+  assert.ok(fences.length > 0)
+  assert.ok(fences.length * 4 < deck.length, `${fences.length} fences vs ${deck.length} deck`)
+
+  const off = await planPaths(grassView(), [{
+    name: 'sand',
+    points: [{ x: 0, z: 4 }, { x: 20, z: 4 }],
+    preset: 'sandstone',
+    options: { ...DEFAULT_OPTIONS, dressing: 'off' }
+  }], BOUNDS)
+  const lined = await planPaths(grassView(), [{
+    name: 'sand',
+    points: [{ x: 0, z: 4 }, { x: 20, z: 4 }],
+    preset: 'sandstone',
+    options: { ...DEFAULT_OPTIONS, dressing: 'lined' }
+  }], BOUNDS)
+  const sig = (cells: { x: number, y: number, z: number, name: string }[]) => cells.map(cell => `${cell.x},${cell.y},${cell.z},${cell.name}`).sort().join('|')
+  assert.equal(sig(off), sig(lined))
+})
+
+test('preview drops clean columns and a cancel returns nothing', async () => {
+  const flat = await flatWorld(DATA_VERSION_26_2)
+  await flat.world.save()
+  const pathSpec = {
+    name: 't',
+    points: [{ x: 2, z: 8 }, { x: 13, z: 8 }],
+    preset: 'trail' as const,
+    options: { ...DEFAULT_OPTIONS }
+  }
+  const cells = await previewPaths(flat.world, 'overworld', [pathSpec])
+  assert.ok(cells.length > 0)
+  assert.equal(flat.world.columnOf('overworld', 0, 0), null)
+  const stopped = await previewPaths(flat.world, 'overworld', [pathSpec], { cancelled: () => true })
+  assert.deepEqual(stopped, [])
+  await flat.world.close()
 })

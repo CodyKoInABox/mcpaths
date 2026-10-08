@@ -1,4 +1,13 @@
 export const DETAIL_CHUNK_BUDGET = 96
+export const DETAIL_CHUNK_CAP = 128
+export const OVERVIEW_BUDGET = 280
+export const OVERVIEW_CHUNK_BUDGET = 240
+
+/** Mirrors core/src/lod.ts. The renderer cannot import the Node core package. */
+export function viewStride(occupied: number): number {
+  if (occupied <= DETAIL_CHUNK_CAP) return 1
+  return Math.max(2, Math.ceil(Math.sqrt(occupied / OVERVIEW_BUDGET)))
+}
 export const MAX_PIXELS_PER_BLOCK = 32
 export const MIN_PIXELS_PER_BLOCK = 0.004
 

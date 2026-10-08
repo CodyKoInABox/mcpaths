@@ -22,6 +22,8 @@ export interface ColumnView {
   get(x: number, y: number, z: number): { name: string }
   biome(x: number, y: number, z: number): string
   protected(x: number, z: number): boolean
+  /** When set, used instead of walking every y. Must match the walk. */
+  ground?(x: number, z: number): { y: number, name: string } | null
 }
 
 interface Ground {
@@ -42,28 +44,57 @@ interface Stamp {
 
 const ROLE = { outer: 1, edge: 2, center: 3 }
 
-export function planPaths(view: ColumnView, paths: NamedPath[], bounds: { minY: number, maxY: number }): Placement[] {
+class StopPlan extends Error {}
+
+interface Cancel {
+  fn?: () => boolean
+  n: number
+}
+
+/** Yields every 64 samples so a newer preview can abort this one. Apply passes no fn and does not yield. */
+async function pause(cancel: Cancel) {
+  if (!cancel.fn) return
+  cancel.n++
+  if ((cancel.n & 63) !== 0) return
+  await new Promise<void>(resolve => { setImmediate(resolve) })
+  if (cancel.fn()) throw new StopPlan()
+}
+
+export async function planPaths(
+  view: ColumnView,
+  paths: NamedPath[],
+  bounds: { minY: number, maxY: number },
+  cancelled?: () => boolean
+): Promise<Placement[]> {
   const cells = new Map<string, Placement>()
   const floors: { x: number, z: number, y: number }[] = []
-  for (const path of paths) {
-    if (path.points.length < 2) continue
-    const samples = resample(path.points)
-    if (samples.length === 0) continue
-    const options = path.options
-    const radius = (widthBlocks(options.width) - 1) / 2
-    const sx = Math.round(samples[0].x)
-    const sz = Math.round(samples[0].z)
-    const start = ground(view, sx, sz, bounds)
-    const biome = view.biome(sx, start?.y ?? bounds.minY, sz)
-    const mats = resolveMaterials(path.preset, biome)
-    if (options.hills === 'tunnel') tunnel(view, samples, radius, mats, options, bounds, cells, floors)
-    else follow(view, samples, radius, mats, path.preset, options, bounds, cells, floors)
+  const cancel: Cancel = { fn: cancelled, n: 0 }
+  try {
+    for (const path of paths) {
+      await pause(cancel)
+      if (path.points.length < 2) continue
+      const samples = resample(path.points)
+      if (samples.length === 0) continue
+      const options = path.options
+      const radius = (widthBlocks(options.width) - 1) / 2
+      const sx = Math.round(samples[0].x)
+      const sz = Math.round(samples[0].z)
+      const start = ground(view, sx, sz, bounds)
+      const biome = view.biome(sx, start?.y ?? bounds.minY, sz)
+      const mats = resolveMaterials(path.preset, biome)
+      if (options.hills === 'tunnel') await tunnel(view, samples, radius, mats, options, bounds, cells, floors, cancel)
+      else await follow(view, samples, radius, mats, path.preset, options, bounds, cells, floors, cancel)
+    }
+    clearTrees(view, floors, bounds, cells)
+    return [...cells.values()]
+  } catch (error) {
+    if (error instanceof StopPlan) return []
+    throw error
   }
-  clearTrees(view, floors, bounds, cells)
-  return [...cells.values()]
 }
 
 function ground(view: ColumnView, x: number, z: number, bounds: { minY: number, maxY: number }): Ground | null {
+  if (view.ground) return view.ground(x, z)
   for (let y = bounds.maxY; y >= bounds.minY; y--) {
     const name = view.get(x, y, z).name
     if (isAir(name) || isHeadroom(name) || isLeaves(name) || isLog(name)) continue
@@ -86,7 +117,7 @@ function opposite(face: string): string {
   }
 }
 
-function follow(
+async function follow(
   view: ColumnView,
   samples: Sample[],
   radius: number,
@@ -95,14 +126,17 @@ function follow(
   options: PathOptions,
   bounds: { minY: number, maxY: number },
   cells: Map<string, Placement>,
-  floors: { x: number, z: number, y: number }[]
+  floors: { x: number, z: number, y: number }[],
+  cancel: Cancel
 ) {
   const stamps = new Map<string, Stamp>()
-  samples.forEach((sample, index) => {
+  for (let index = 0; index < samples.length; index++) {
+    await pause(cancel)
+    const sample = samples[index]
     const cx = Math.round(sample.x)
     const cz = Math.round(sample.z)
     const here = ground(view, cx, cz, bounds)
-    if (!here) return
+    if (!here) continue
     const next = samples[index + 1]
     let uphill: string | null = null
     if (next && mats.stair) {
@@ -126,12 +160,12 @@ function follow(
       if (prev && ROLE[prev.role] >= ROLE[role]) continue
       stamps.set(key, { x, z, role, along: sample.along, tx: sample.tx, tz: sample.tz, pathY: here.y, uphill: role === 'center' ? uphill : null })
     }
-  })
+  }
   for (const stamp of stamps.values()) {
     const g = ground(view, stamp.x, stamp.z, bounds)
     if (!g) continue
     if (isWater(g.name)) {
-      waterColumn(view, stamp, g, mats, options, bounds, cells, floors)
+      waterColumn(view, stamp, g, mats, preset, options, bounds, cells, floors)
       continue
     }
     const alt = stamp.role === 'center' && hash01(stamp.x, stamp.z) < 0.15
@@ -160,6 +194,7 @@ function waterColumn(
   stamp: Stamp,
   g: Ground,
   mats: Materials,
+  preset: NamedPath['preset'],
   options: PathOptions,
   bounds: { minY: number, maxY: number },
   cells: Map<string, Placement>,
@@ -174,6 +209,8 @@ function waterColumn(
     put(cells, stamp.x, g.y + 1, stamp.z, surface, {})
     floors.push({ x: stamp.x, z: stamp.z, y: g.y + 1 })
     if (surface === 'dirt_path') solidUnder(view, stamp.x, g.y + 1, stamp.z, mats.fill, cells)
+    clearHeadroom(view, stamp.x, g.y + 1, stamp.z, cells)
+    dress(stamp, g.y + 1, mats, preset, options, cells)
     return
   }
   const deck = g.y + 1
@@ -187,27 +224,27 @@ function waterColumn(
       put(cells, stamp.x, y, stamp.z, mats.support, mats.support.endsWith('_fence') ? fenceProps() : {})
     }
   }
-  if ((mats.railings || options.dressing !== 'off') && stamp.role === 'outer' && mats.fence) {
-    put(cells, stamp.x, deck + 1, stamp.z, mats.fence, fenceProps())
-  }
   clearHeadroom(view, stamp.x, deck, stamp.z, cells)
+  dress(stamp, deck, mats, preset, options, cells)
 }
 
-function tunnel(
+async function tunnel(
   view: ColumnView,
   samples: Sample[],
   radius: number,
   mats: Materials,
-  options: PathOptions,
+  _options: PathOptions,
   bounds: { minY: number, maxY: number },
   cells: Map<string, Placement>,
-  floors: { x: number, z: number, y: number }[]
+  floors: { x: number, z: number, y: number }[],
+  cancel: Cancel
 ) {
   const grounds = samples.map(sample => ground(view, Math.round(sample.x), Math.round(sample.z), bounds)).filter((g): g is Ground => !!g && !isWater(g.name))
   if (grounds.length === 0) return
   const floorY = Math.min(...grounds.map(g => g.y))
   const last = samples[samples.length - 1].along
   for (const sample of samples) {
+    await pause(cancel)
     const mouth = sample.along <= 2 || sample.along >= last - 2
     const airR = wanderedRadius(Math.round(sample.x), Math.round(sample.z), radius) + (mouth ? 1 : 0)
     const height = 3 + (mouth ? 1 : 0)
@@ -217,6 +254,8 @@ function tunnel(
       const x = Math.round(sample.x + nx * offset)
       const z = Math.round(sample.z + nz * offset)
       if (view.protected(x, z)) continue
+      const here = ground(view, x, z, bounds)
+      if (!here || isWater(here.name)) continue
       const wall = Math.abs(offset) > airR
       if (wall) {
         for (let y = floorY; y <= floorY + height + 1; y++) put(cells, x, y, z, lineBlock(y), {})
@@ -233,7 +272,8 @@ function tunnel(
     if (sample.along % 8 === 0) {
       const x = Math.round(sample.x)
       const z = Math.round(sample.z)
-      if (!view.protected(x, z)) put(cells, x, floorY + 2, z, 'lantern', { hanging: 'true' })
+      const here = ground(view, x, z, bounds)
+      if (here && !isWater(here.name) && !view.protected(x, z)) put(cells, x, floorY + 2, z, 'lantern', { hanging: 'true' })
     }
   }
 }
@@ -243,13 +283,14 @@ function lineBlock(y: number): string {
 }
 
 function dress(stamp: Stamp, y: number, mats: Materials, preset: NamedPath['preset'], options: PathOptions, cells: Map<string, Placement>) {
-  if (options.dressing === 'off') return
-  const lined = options.dressing === 'lined'
+  // Boardwalk fences are part of the preset. Dressing only adds or removes plants, posts, and lanterns.
   if (mats.railings && stamp.role === 'outer' && mats.fence) {
     put(cells, stamp.x, y + 1, stamp.z, mats.fence, fenceProps())
-    if (lined && stamp.along % 8 === 0) put(cells, stamp.x, y + 2, stamp.z, 'lantern', { hanging: 'false' })
+    if (options.dressing === 'lined' && stamp.along % 8 === 0) put(cells, stamp.x, y + 2, stamp.z, 'lantern', { hanging: 'false' })
     return
   }
+  if (options.dressing === 'off') return
+  const lined = options.dressing === 'lined'
   if (preset === 'cobble' && stamp.role === 'outer' && mats.fence) {
     const step = lined ? 8 : 16
     if (stamp.along % step === 0) {

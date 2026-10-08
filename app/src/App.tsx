@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
-import { DETAIL_CHUNK_BUDGET, MAX_PIXELS_PER_BLOCK, MIN_PIXELS_PER_BLOCK, farPixelsPerBlock, sliderToZoom, zoomToSlider } from './lod'
+import { DETAIL_CHUNK_BUDGET, MAX_PIXELS_PER_BLOCK, MIN_PIXELS_PER_BLOCK, OVERVIEW_CHUNK_BUDGET, farPixelsPerBlock, sliderToZoom, zoomToSlider } from './lod'
+import { scanViewport } from '../../core/src/viewscan'
 import { paintSwatch } from './swatches'
 import {
   DEFAULT_OPTIONS,
@@ -43,6 +44,21 @@ const GAME_LABEL: Record<string, string> = {
   spectator: 'Spectator'
 }
 
+const PRESET_BLURB: Record<PresetId, string> = {
+  trail: 'Dirt path down the middle, coarse dirt and rooted dirt on the sides. The outer edge skips some blocks so it looks worn.',
+  cobble: 'Cobblestone center, stone brick edges, gravel shoulders. A one-block rise in the center becomes cobble stairs.',
+  moss: 'Moss center and shoulders, rooted dirt edges. A one-block rise becomes mossy cobble stairs.',
+  sandstone: 'Smooth sandstone center, cut sandstone edges, sand shoulders.',
+  adaptive: 'Materials come from the biome under the first point only. Badlands are red sandstone, deserts sandstone, swamps and mangroves a boardwalk, jungles moss. Snowy, ice, frozen, and grove biomes are packed ice. Stony or jagged peaks and windswept hills are stone brick. Other forests, taiga, birch, and cherry are moss. Everywhere else is a trail.',
+  boardwalk: 'Planks and fences in the wood of the biome under the first point (spruce, unless the biome names a tree). Fences stay even when dressing is off.'
+}
+
+const DRESSING_BLURB: Record<PathOptions['dressing'], string> = {
+  off: 'No plants or lamp posts. A boardwalk still gets its fences.',
+  subtle: 'A few plants on trail, moss, and adaptive edges. Cobble gets a lamp post about every 16 blocks.',
+  lined: 'Denser plants. Cobble posts about every 8 blocks. Fences, including boardwalks, get a lantern every 8 blocks.'
+}
+
 type MapPhase = 'loading' | 'ready' | 'empty' | 'error'
 const TILE = 16
 const TILE_BYTES = TILE * TILE * 3
@@ -83,6 +99,13 @@ export function App() {
   const regionsReady = useRef(false)
   const sampleTimer = useRef(0)
   const busyRef = useRef(false)
+  const previewSeq = useRef(0)
+  const pathStore = useRef<Record<Dimension, SurveyPath[]>>({ overworld: [], nether: [], end: [] })
+  const overviewRef = useRef(new Map<string, OverviewCell>())
+  const lodRef = useRef({ stride: 1 })
+  const visibleChunks = useRef<{ cx: number, cz: number }[]>([])
+  const dragPoints = useRef<XZ[] | null>(null)
+  const stampRef = useRef({ w: 0, h: 0, data: new Uint32Array(0), stamp: 1 })
   const coordRef = useRef<HTMLSpanElement>(null)
   const visibleRef = useRef<HTMLSpanElement>(null)
 
@@ -100,20 +123,27 @@ export function App() {
     maskRef.current = new Map()
     maskListRef.current = []
     tilesRef.current = new Map()
+    overviewRef.current = new Map()
+    lodRef.current.stride = 1
     spanRef.current = null
     minZoomRef.current = MIN_PIXELS_PER_BLOCK
     setMinZoom(MIN_PIXELS_PER_BLOCK)
-    pendingFocus.current = focusOf(payload.info, 'overworld')
+    const start = startDimension(payload)
+    pendingFocus.current = focusOf(payload.info, start)
     view.current.scale = 8
     setZoom(8)
     setWorld(payload)
-    setDim('overworld')
+    setDim(start)
     setMapPhase('loading')
     setMapMessage('Indexing regions…')
     const first = newPath('Path 1')
+    pathStore.current = { overworld: [], nether: [], end: [] }
+    pathStore.current[start] = [first]
     setPaths([first])
     setActiveId(first.id)
-    note(`${payload.info.name} · ${payload.info.versionName} · data ${payload.info.dataVersion}`)
+    setPreview([])
+    const where = payload.info.player?.dimension === start ? 'at the player' : start === 'overworld' ? 'at spawn' : 'at the origin'
+    note(`${payload.info.name} · ${payload.info.versionName} · data ${payload.info.dataVersion} · ${DIM_LABEL[start]} ${where}`)
   }
 
   const loadSaves = useCallback(() => {
@@ -140,6 +170,13 @@ export function App() {
       setListPhase('error')
       const message = error instanceof Error ? error.message : 'Could not list saves.'
       if (!worldRef.current) note(message, true)
+    })
+  }, [])
+
+  useEffect(() => {
+    if (!window.mcpaths) return
+    return window.mcpaths.onMapProgress(message => {
+      if (busyRef.current && message) note(message)
     })
   }, [])
 
@@ -197,7 +234,22 @@ export function App() {
         paintRef.current()
         return
       }
-      const occupied = occupiedInView(stage, view.current, maskRef.current)
+      const scanned = scanViewport(
+        view.current.originX,
+        view.current.originZ,
+        stage.clientWidth / view.current.scale,
+        stage.clientHeight / view.current.scale,
+        maskRef.current,
+        maskListRef.current
+      )
+      lodRef.current.stride = scanned.stride
+      if (scanned.stride > 1) {
+        visibleChunks.current = []
+        await fillOverview(seq, passForce, scanned.picks, scanned.count, scanned.stride)
+        return
+      }
+      const occupied = scanned.chunks
+      visibleChunks.current = occupied
       const missing = occupied.filter(chunk => !tilesRef.current.has(tileKey(dim, chunk.cx, chunk.cz)))
       if (missing.length === 0) {
         if (seq !== sampleSeq.current) return
@@ -288,8 +340,106 @@ export function App() {
       }
     }
 
+    async function fillOverview(seq: number, passForce: boolean, picks: { cx: number, cz: number, sx: number, sz: number }[], count: number, stride: number) {
+      const missing = picks.filter(pick => !overviewRef.current.has(overviewKey(dim, pick.sx, pick.sz, stride)))
+      if (missing.length === 0) {
+        if (seq !== sampleSeq.current) return
+        if (!regionsReady.current && count === 0) {
+          setMapPhase('loading')
+          setMapMessage('Indexing regions…')
+        } else if (count === 0 && jumpToTerrain()) {
+          void sampleRef.current()
+          return
+        } else {
+          setMapPhase('ready')
+          setMapMessage(count === 0 ? '' : 'Overview — zoom in for every block')
+        }
+        paintRef.current()
+        return
+      }
+      const total = picks.length
+      let done = total - missing.length
+      setMapPhase('loading')
+      setMapMessage(`Overview ${done} / ${total}…`)
+      paintRef.current()
+      let live = true
+      const off = window.mcpaths.onMapProgress(message => {
+        if (live && seq === sampleSeq.current) setMapMessage(message)
+      })
+      try {
+        let first = passForce
+        let failed = 0
+        const byChunk = new Map(picks.map(pick => [`${pick.cx},${pick.cz}`, pick]))
+        for (let i = 0; i < missing.length; i += OVERVIEW_CHUNK_BUDGET) {
+          if (seq !== sampleSeq.current || !worldRef.current) return
+          const batch = missing.slice(i, i + OVERVIEW_CHUNK_BUDGET)
+          const result = await window.mcpaths.tiles({
+            dim,
+            chunks: batch.map(pick => ({ cx: pick.cx, cz: pick.cz })),
+            force: first,
+            quality: 'color'
+          })
+          first = false
+          if (seq !== sampleSeq.current || !worldRef.current) return
+          if (result.cancelled) return
+          if (!result.ok || !result.data) {
+            setMapPhase('error')
+            setMapMessage(result.error || 'The map could not be read.')
+            note(result.error || 'The map could not be read.', true)
+            paintRef.current()
+            return
+          }
+          const cx = numberList(result.data.cx)
+          const cz = numberList(result.data.cz)
+          const rgb = bytesOf(result.data.rgb)
+          const count = Math.min(cx.length, cz.length, Math.floor(rgb.length / 3))
+          for (let n = 0; n < count; n++) {
+            const pick = byChunk.get(`${cx[n]},${cz[n]}`)
+            if (!pick) continue
+            const i0 = n * 3
+            overviewRef.current.set(overviewKey(dim, pick.sx, pick.sz, stride), {
+              dim,
+              cx: pick.sx,
+              cz: pick.sz,
+              stride,
+              rgb: [rgb[i0] ?? 0, rgb[i0 + 1] ?? 0, rgb[i0 + 2] ?? 0]
+            })
+          }
+          failed += result.data.failed || 0
+          done += count
+          paintRef.current()
+          setMapMessage(`Overview ${Math.min(done, total)} / ${total}…`)
+          await new Promise<void>(resolve => { window.setTimeout(resolve, 0) })
+          if (seq !== sampleSeq.current || !worldRef.current) return
+        }
+        if (seq !== sampleSeq.current) return
+        live = false
+        if (failed > 0 && done === 0) {
+          setMapPhase('error')
+          setMapMessage('Region files could not be read.')
+          note('Region files could not be read.', true)
+          return
+        }
+        setMapPhase('ready')
+        setMapMessage('Overview — zoom in for every block')
+        if (failed > 0) note(`${failed} chunk${failed === 1 ? '' : 's'} could not be read.`, true)
+      } catch (error) {
+        if (seq !== sampleSeq.current || !worldRef.current) return
+        const message = error instanceof Error ? error.message : 'The map could not be read.'
+        setMapPhase('error')
+        setMapMessage(message)
+        note(message, true)
+        paintRef.current()
+      } finally {
+        off()
+      }
+    }
+
     const seq = ++sampleSeq.current
-    if (force) tilesRef.current.clear()
+    if (force) {
+      tilesRef.current.clear()
+      overviewRef.current.clear()
+    }
     paintRef.current()
     await fillTiles(seq, force)
   }, [dim, jumpToTerrain])
@@ -303,8 +453,12 @@ export function App() {
     const cssW = canvas.clientWidth
     const cssH = canvas.clientHeight
     if (cssW < 2 || cssH < 2) return
-    canvas.width = Math.floor(cssW * dpr)
-    canvas.height = Math.floor(cssH * dpr)
+    const targetW = Math.max(1, Math.floor(cssW * dpr))
+    const targetH = Math.max(1, Math.floor(cssH * dpr))
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW
+      canvas.height = targetH
+    }
     const ctx = canvas.getContext('2d')
     if (!ctx) return
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
@@ -313,8 +467,9 @@ export function App() {
     const scale = view.current.scale
     const originX = view.current.originX
     const originZ = view.current.originZ
-    drawTerrain(ctx, cssW, cssH, originX, originZ, scale, maskRef.current, tilesRef.current, dim)
-    if (16 * scale >= 8) strokeGrid(ctx, cssW, cssH, originX, originZ, scale, 16, 'rgba(232, 238, 246, 0.16)', 1)
+    if (lodRef.current.stride > 1) drawOverview(ctx, cssW, cssH, originX, originZ, scale, dim, overviewRef.current, lodRef.current.stride)
+    else drawChunkList(ctx, cssW, cssH, originX, originZ, scale, visibleChunks.current, tilesRef.current, dim)
+    if (lodRef.current.stride === 1 && 16 * scale >= 8) strokeGrid(ctx, cssW, cssH, originX, originZ, scale, 16, 'rgba(232, 238, 246, 0.16)', 1)
     if (512 * scale >= 16) strokeGrid(ctx, cssW, cssH, originX, originZ, scale, 512, 'rgba(232, 238, 246, 0.28)', 1)
     const current = worldRef.current
     if (current && dim === 'overworld') {
@@ -324,26 +479,20 @@ export function App() {
       ctx.lineWidth = 1
       ctx.strokeRect(sx - 5, sz - 5, 10, 10)
     }
-    for (const cell of preview) {
-      const sx = (cell.x - originX) * scale
-      const sz = (cell.z - originZ) * scale
-      ctx.fillStyle = COLORS[cell.name] || '#d7a15e'
-      ctx.globalAlpha = 0.72
-      ctx.fillRect(sx, sz, Math.max(scale, 1), Math.max(scale, 1))
-      ctx.globalAlpha = 1
-    }
+    drawPreview(ctx, cssW, cssH, originX, originZ, scale, preview, stampRef.current)
     for (const path of paths) {
+      const points = path.id === activeId && dragPoints.current ? dragPoints.current : path.points
       ctx.strokeStyle = path.id === activeId ? '#e4b15a' : '#3dbea5'
       ctx.lineWidth = 2
       ctx.beginPath()
-      path.points.forEach((point, index) => {
+      points.forEach((point, index) => {
         const sx = (point.x - originX + 0.5) * scale
         const sz = (point.z - originZ + 0.5) * scale
         if (index === 0) ctx.moveTo(sx, sz)
         else ctx.lineTo(sx, sz)
       })
       ctx.stroke()
-      for (const point of path.points) {
+      for (const point of points) {
         const sx = (point.x - originX + 0.5) * scale
         const sz = (point.z - originZ + 0.5) * scale
         ctx.fillStyle = path.id === activeId ? '#f4efe4' : '#3dbea5'
@@ -353,8 +502,9 @@ export function App() {
       }
     }
     if (visibleRef.current) {
-      const visible = countVisible(canvas, view.current, maskRef.current)
-      visibleRef.current.textContent = `${visible} chunks in view`
+      visibleRef.current.textContent = lodRef.current.stride > 1
+        ? 'overview'
+        : `${visibleChunks.current.length} chunks in view`
     }
   }, [paths, activeId, preview, dim])
 
@@ -371,6 +521,9 @@ export function App() {
     }
     pendingFocus.current = focusOf(world.info, dim)
     tilesRef.current = new Map()
+    overviewRef.current = new Map()
+    visibleChunks.current = []
+    lodRef.current.stride = 1
     spanRef.current = null
     maskRef.current = new Map()
     maskListRef.current = []
@@ -440,11 +593,14 @@ export function App() {
       setPreview([])
       return
     }
+    const seq = ++previewSeq.current
     const handle = window.setTimeout(() => {
       window.mcpaths.preview({ dim, paths: ready }).then(result => {
+        if (seq !== previewSeq.current || result.cancelled) return
         if (result.ok) setPreview(result.data || [])
         else note(result.error || 'Preview failed.', true)
       }).catch((error: unknown) => {
+        if (seq !== previewSeq.current) return
         note(error instanceof Error ? error.message : 'Preview failed.', true)
       })
     }, 120)
@@ -548,10 +704,26 @@ export function App() {
     el.textContent = `block ${block.x}, ${block.z}    chunk ${loc.chunkX}, ${loc.chunkZ}    region ${loc.regionX}, ${loc.regionZ}`
   }
 
-  function pointIndex(block: XZ): number {
+  function hitPoint(event: { clientX: number, clientY: number }): number {
     const path = paths.find(item => item.id === activeId)
-    if (!path) return -1
-    return path.points.findIndex(point => point.x === block.x && point.z === block.z)
+    const canvas = canvasRef.current
+    if (!path || !canvas) return -1
+    const rect = canvas.getBoundingClientRect()
+    const scale = view.current.scale
+    const grab = Math.max(12, scale * 0.55)
+    let best = -1
+    let bestD = grab * grab
+    for (let index = 0; index < path.points.length; index++) {
+      const point = path.points[index]
+      const sx = rect.left + (point.x - view.current.originX + 0.5) * scale
+      const sy = rect.top + (point.z - view.current.originZ + 0.5) * scale
+      const d = (sx - event.clientX) ** 2 + (sy - event.clientY) ** 2
+      if (d <= bestD) {
+        bestD = d
+        best = index
+      }
+    }
+    return best
   }
 
   function onDown(event: ReactMouseEvent) {
@@ -562,14 +734,14 @@ export function App() {
       drag.current = { mode: 'pan', index: -1, sx: event.clientX, sy: event.clientY, ox: view.current.originX, oz: view.current.originZ }
       return
     }
-    const index = pointIndex(block)
+    const index = hitPoint(event)
     if (index >= 0) {
       drag.current = { mode: 'point', index, sx: event.clientX, sy: event.clientY, ox: block.x, oz: block.z }
       return
     }
     const path = paths.find(item => item.id === activeId)
     if (path && !path.draft) {
-      note('That path is finished. New path to draw another.')
+      note('This path is finished, so a click will not add a point. Drag a point, or choose Edit path.', true)
       return
     }
     setPaths(list => list.map(item => item.id === activeId ? { ...item, points: [...item.points, block] } : item))
@@ -586,16 +758,22 @@ export function App() {
       return
     }
     const block = toBlock(event)
-    setPaths(list => list.map(path => {
-      if (path.id !== activeId) return path
-      const points = path.points.slice()
-      points[current.index] = block
-      return { ...path, points }
-    }))
+    const path = paths.find(item => item.id === activeId)
+    if (!path || current.index < 0 || current.index >= path.points.length) return
+    const points = (dragPoints.current ?? path.points).slice()
+    points[current.index] = block
+    dragPoints.current = points
+    paint()
   }
 
   function onUp() {
-    if (drag.current?.mode === 'pan') void sample()
+    const current = drag.current
+    const moved = dragPoints.current
+    dragPoints.current = null
+    if (current?.mode === 'point' && moved) {
+      setPaths(list => list.map(path => path.id === activeId ? { ...path, points: moved } : path))
+    }
+    if (current?.mode === 'pan') void sample()
     drag.current = null
   }
 
@@ -714,16 +892,73 @@ export function App() {
 
   function leaveWorld() {
     sampleSeq.current++
+    previewSeq.current++
     worldRef.current = null
     tilesRef.current = new Map()
+    overviewRef.current = new Map()
+    lodRef.current.stride = 1
     spanRef.current = null
+    pathStore.current = { overworld: [], nether: [], end: [] }
+    setPreview([])
+    setPaths([])
+    setActiveId(null)
     setWorld(null)
     note(saves.length ? 'Pick a save, or open a folder.' : 'No saves in the usual folders.')
   }
 
+  function switchDim(next: Dimension) {
+    if (next === dim) return
+    pathStore.current[dim] = paths
+    const stored = pathStore.current[next]
+    if (stored && stored.length > 0) {
+      setPaths(stored)
+      setActiveId(stored[0].id)
+    } else {
+      const first = newPath('Path 1')
+      pathStore.current[next] = [first]
+      setPaths([first])
+      setActiveId(first.id)
+    }
+    setPreview([])
+    setDim(next)
+    note(`Paths are kept per dimension. These points belong to the ${DIM_LABEL[next]}.`)
+  }
+
+  function toggleDraft() {
+    const path = paths.find(item => item.id === activeId)
+    if (!path) return
+    if (path.draft && path.points.length < 2) {
+      note('Add at least two points, then finish the path.', true)
+      return
+    }
+    const finished = path.draft
+    setPaths(list => list.map(item => item.id === activeId ? { ...item, draft: !item.draft } : item))
+    note(finished
+      ? `${path.name} is finished. Clicks no longer add points. Apply still writes it.`
+      : `${path.name} can take new points again.`)
+  }
+
+  function undoPoint() {
+    setPaths(list => list.map(path => path.id === activeId ? { ...path, draft: true, points: path.points.slice(0, -1) } : path))
+  }
+
+  function clearPoints() {
+    setPaths(list => list.map(path => path.id === activeId ? { ...path, draft: true, points: [] } : path))
+    note('Cleared the points on this path.')
+  }
+
+  function deletePath() {
+    if (paths.length <= 1) return
+    const list = paths.filter(path => path.id !== activeId)
+    setPaths(list)
+    setActiveId(list[0].id)
+  }
+
   const active = paths.find(path => path.id === activeId) || null
+  const readyCount = paths.filter(path => path.points.length >= 2).length
   const showFloat = Boolean(world && (mapPhase !== 'ready' || mapMessage))
   const foundRoots = roots.filter(root => root.exists)
+  const presetLabel = (id: PresetId) => PRESETS.find(preset => preset.id === id)?.label ?? id
 
   return (
     <div className="app">
@@ -734,18 +969,19 @@ export function App() {
             <button className="ghost" onClick={leaveWorld}>Saves</button>
             <div className="world-title" title={`${world.info.path}\n${world.info.versionName} · data ${world.info.dataVersion}`}>
               <strong>{world.info.name || world.info.folder}</strong>
-              <span>{world.info.folder !== world.info.name ? world.info.folder : world.info.versionName}</span>
+              <span>{world.info.versionName}{world.info.folder !== world.info.name ? ` · ${world.info.folder}` : ''}</span>
             </div>
             <div className="dims">
               {world.dimensions.map(item => (
                 <button
                   key={item.id}
-                  className={item.id === dim ? 'on' : ''}
-                  onClick={() => { if (item.id !== dim) setDim(item.id) }}
-                >{DIM_LABEL[item.id]}</button>
+                  className={`${item.id === dim ? 'on' : ''}${item.hasFiles ? '' : ' empty'}`}
+                  title={item.hasFiles ? `Show the ${DIM_LABEL[item.id]}` : `No region files for the ${DIM_LABEL[item.id]}`}
+                  onClick={() => switchDim(item.id)}
+                >{DIM_LABEL[item.id]}{item.hasFiles ? '' : ' · empty'}</button>
               ))}
             </div>
-            <label className="zoom">
+            <label className="zoom" title="Pixels used to draw one block. Scroll the map to zoom toward the cursor.">
               <span>Zoom</span>
               <button type="button" className="icon" onClick={() => applyScale(view.current.scale / 1.25)} aria-label="Zoom out">−</button>
               <input
@@ -792,16 +1028,23 @@ export function App() {
                   )}
                 </div>
               )}
+              {mapPhase === 'ready' && active && active.points.length === 0 && (
+                <div className="map-help">
+                  <strong>Click the map to place points</strong>
+                  <span>Two points define {active.name}. Drag a point to move it. Right-drag pans, the wheel zooms.</span>
+                </div>
+              )}
             </div>
             <aside className="dock">
               <div className="dock-scroll">
                 <section className="panel">
                   <h2>Paths</h2>
+                  <p className="hint">Each path keeps its own preset and shape. Apply writes every path in this dimension that has two or more points.</p>
                   <div className="paths">
                     {paths.map(path => (
                       <button key={path.id} className={path.id === activeId ? 'path on' : 'path'} onClick={() => setActiveId(path.id)}>
-                        <span>{path.name}</span>
-                        <small>{path.points.length} pts{path.draft ? '' : ' · finished'}</small>
+                        <span className="path-name">{path.name.trim() || 'Untitled'}</span>
+                        <small>{path.points.length} {path.points.length === 1 ? 'point' : 'points'} · {presetLabel(path.preset)} · {path.draft ? 'drawing' : 'finished'}</small>
                       </button>
                     ))}
                   </div>
@@ -813,28 +1056,54 @@ export function App() {
                 </section>
                 {active && (
                   <section className="panel">
+                    <h2>This path</h2>
+                    <label className="field">Name
+                      <input
+                        className="text"
+                        value={active.name}
+                        maxLength={48}
+                        aria-label="Path name"
+                        onChange={event => updateActive({ name: event.target.value })}
+                      />
+                    </label>
+                    <div className="row-actions">
+                      <button type="button" onClick={toggleDraft} disabled={active.draft && active.points.length < 2} title="Finished paths ignore new clicks. Apply still writes them.">
+                        {active.draft ? 'Finish path' : 'Edit path'}
+                      </button>
+                      <button type="button" onClick={undoPoint} disabled={active.points.length === 0} title="Remove the last point (Backspace)">Undo</button>
+                      <button type="button" onClick={clearPoints} disabled={active.points.length === 0} title="Remove every point (Escape)">Clear</button>
+                    </div>
+                    <button type="button" className="ghost block" onClick={deletePath} disabled={paths.length <= 1} title={paths.length <= 1 ? 'The list always keeps one path. Clear removes its points.' : 'Remove this path from the list'}>
+                      Delete path
+                    </button>
+                  </section>
+                )}
+                {active && (
+                  <section className="panel">
                     <h2>Preset</h2>
                     <div className="presets">
                       {PRESETS.map(preset => (
-                        <button key={preset.id} className={active.preset === preset.id ? 'preset on' : 'preset'} onClick={() => updateActive({ preset: preset.id })}>
+                        <button key={preset.id} className={active.preset === preset.id ? 'preset on' : 'preset'} title={PRESET_BLURB[preset.id]} onClick={() => updateActive({ preset: preset.id })}>
                           <Swatch preset={preset.id} />
                           <span>{preset.label}</span>
                         </button>
                       ))}
                     </div>
+                    <p className="hint">{PRESET_BLURB[active.preset]}</p>
                   </section>
                 )}
                 {active && (
                   <section className="panel">
                     <h2>Shape</h2>
-                    <Options value={active.options} onChange={options => updateActive({ options })} />
+                    <Options preset={active.preset} value={active.options} onChange={options => updateActive({ options })} />
                   </section>
                 )}
               </div>
               <div className="dock-foot">
-                <button className="primary block" disabled={busy || !active} onClick={() => void apply()}>
-                  {busy ? 'Writing chunks…' : 'Apply path'}
+                <button className="primary block" disabled={busy || readyCount === 0} onClick={() => void apply()} title={readyCount === 0 ? 'Add at least two points on a path' : 'Backup each region, then write the paths'}>
+                  {busy ? 'Writing chunks…' : readyCount > 1 ? `Apply ${readyCount} paths` : 'Apply path'}
                 </button>
+                <p className="hint">Close the world in Minecraft first. Copies each touched region into .mcpaths-backup, then edits blocks in place. Bedrock stays. A column with a chest, shulker, spawner, or any block entity is skipped. Lighting is cleared so Minecraft rebuilds it.</p>
               </div>
             </aside>
           </>
@@ -897,7 +1166,7 @@ export function App() {
       <footer className="statusbar">
         <span ref={coordRef}>block —</span>
         <span ref={visibleRef} />
-        {world && <span>{paths.length} paths · {active?.points.length ?? 0} pts</span>}
+        {world && <span>{DIM_LABEL[dim]} · {paths.length} {paths.length === 1 ? 'path' : 'paths'} · {active?.points.length ?? 0} {active?.points.length === 1 ? 'point' : 'points'}</span>}
         <span className={bad ? 'message bad' : 'message'}>{status}</span>
         <span className="hints">
           {world
@@ -919,37 +1188,77 @@ function Swatch({ preset }: { preset: PresetId }) {
   return <canvas ref={ref} width={88} height={36} />
 }
 
-function Options({ value, onChange }: { value: PathOptions, onChange: (value: PathOptions) => void }) {
+function Options({ preset, value, onChange }: { preset: PresetId, value: PathOptions, onChange: (value: PathOptions) => void }) {
+  const tunnel = value.hills === 'tunnel'
+  const dressingOff = tunnel || preset === 'sandstone'
+  const dressingHint = tunnel
+    ? 'Not used while Tunnel is on. The tunnel already places stone lining and lanterns.'
+    : preset === 'sandstone'
+      ? 'Not used for Sandstone way. That preset has no plants or lamp posts.'
+      : DRESSING_BLURB[value.dressing]
   return (
     <div className="options">
-      <Choice label="Width" value={value.width} options={[['narrow', 'Narrow 3'], ['normal', 'Normal 5'], ['wide', 'Wide 7']]} onChange={width => onChange({ ...value, width: width as PathOptions['width'] })} />
-      <div className="diagrams">
-        <Diagram on={value.hills === 'follow'} kind="follow" onClick={() => onChange({ ...value, hills: 'follow' })} />
-        <Diagram on={value.hills === 'tunnel'} kind="tunnel" onClick={() => onChange({ ...value, hills: 'tunnel' })} />
-        <Diagram on={value.water === 'bridge'} kind="bridge" onClick={() => onChange({ ...value, water: 'bridge' })} />
-        <Diagram on={value.water === 'causeway'} kind="causeway" onClick={() => onChange({ ...value, water: 'causeway' })} />
-      </div>
-      <Choice label="Dressing" value={value.dressing} options={[['off', 'Off'], ['subtle', 'Subtle'], ['lined', 'Lined']]} onChange={dressing => onChange({ ...value, dressing: dressing as PathOptions['dressing'] })} />
+      <Choice
+        label="Width"
+        hint="How many blocks across, including the edges. The sides wander by one block."
+        value={value.width}
+        options={[['narrow', 'Narrow 3'], ['normal', 'Normal 5'], ['wide', 'Wide 7']]}
+        onChange={width => onChange({ ...value, width: width as PathOptions['width'] })}
+      />
+      <fieldset className="group">
+        <legend>Hills</legend>
+        <p className="hint">Follow sits on the ground and climbs. Tunnel cuts a flat passage at the lowest dry ground, with stone brick walls and a lantern every 8 blocks.</p>
+        <div className="diagrams">
+          <Diagram on={value.hills === 'follow'} kind="follow" onClick={() => onChange({ ...value, hills: 'follow' })} />
+          <Diagram on={value.hills === 'tunnel'} kind="tunnel" onClick={() => onChange({ ...value, hills: 'tunnel' })} />
+        </div>
+      </fieldset>
+      <fieldset className={tunnel ? 'group is-idle' : 'group'}>
+        <legend>Water</legend>
+        <p className="hint">{tunnel
+          ? 'Not used while Tunnel is on. A tunnel skips water instead of crossing it.'
+          : 'Bridge decks one block above the water and puts a support under the center every 4 blocks. Causeway fills the water and paves the top.'}</p>
+        <div className="diagrams">
+          <Diagram disabled={tunnel} on={value.water === 'bridge'} kind="bridge" onClick={() => onChange({ ...value, water: 'bridge' })} />
+          <Diagram disabled={tunnel} on={value.water === 'causeway'} kind="causeway" onClick={() => onChange({ ...value, water: 'causeway' })} />
+        </div>
+      </fieldset>
+      <Choice
+        label="Dressing"
+        hint={dressingHint}
+        value={value.dressing}
+        disabled={dressingOff}
+        options={[['off', 'Off'], ['subtle', 'Subtle'], ['lined', 'Lined']]}
+        onChange={dressing => onChange({ ...value, dressing: dressing as PathOptions['dressing'] })}
+      />
     </div>
   )
 }
 
-function Choice({ label, value, options, onChange }: { label: string, value: string, options: [string, string][], onChange: (value: string) => void }) {
+function Choice({ label, hint, value, options, disabled, onChange }: { label: string, hint?: string, value: string, options: [string, string][], disabled?: boolean, onChange: (value: string) => void }) {
   return (
-    <label className="field">{label}
+    <label className={disabled ? 'field is-idle' : 'field'}>{label}
+      {hint && <span className="hint">{hint}</span>}
       <div className="choice">
         {options.map(([id, text]) => (
-          <button type="button" key={id} className={value === id ? 'on' : ''} onClick={() => onChange(id)}>{text}</button>
+          <button type="button" key={id} className={value === id ? 'on' : ''} disabled={disabled} onClick={() => onChange(id)}>{text}</button>
         ))}
       </div>
     </label>
   )
 }
 
-function Diagram({ kind, on, onClick }: { kind: 'follow' | 'tunnel' | 'bridge' | 'causeway', on: boolean, onClick: () => void }) {
+function Diagram({ kind, on, disabled, onClick }: { kind: 'follow' | 'tunnel' | 'bridge' | 'causeway', on: boolean, disabled?: boolean, onClick: () => void }) {
   const label = kind === 'follow' ? 'Follow' : kind === 'tunnel' ? 'Tunnel' : kind === 'bridge' ? 'Bridge' : 'Causeway'
+  const detail = kind === 'follow'
+    ? 'Lay the path on the surface'
+    : kind === 'tunnel'
+      ? 'Cut a level passage through the hill'
+      : kind === 'bridge'
+        ? 'Deck over water'
+        : 'Fill water, then pave'
   return (
-    <button type="button" className={on ? 'diagram on' : 'diagram'} onClick={onClick}>
+    <button type="button" className={on ? 'diagram on' : 'diagram'} disabled={disabled} title={detail} onClick={onClick}>
       <svg viewBox="0 0 80 40" aria-hidden="true">
         {kind === 'follow' && <polyline points="4,30 24,28 40,18 58,16 76,8" fill="none" stroke="#3dbea5" strokeWidth="3" />}
         {kind === 'tunnel' && <>
@@ -970,6 +1279,13 @@ function Diagram({ kind, on, onClick }: { kind: 'follow' | 'tunnel' | 'bridge' |
       <span className="diagram-label">{label}</span>
     </button>
   )
+}
+
+function startDimension(payload: WorldPayload): Dimension {
+  const playerDim = payload.info.player?.dimension
+  if (playerDim && payload.dimensions.some(item => item.id === playerDim && item.hasFiles)) return playerDim
+  if (payload.dimensions.some(item => item.id === 'overworld' && item.hasFiles)) return 'overworld'
+  return payload.dimensions.find(item => item.hasFiles)?.id ?? 'overworld'
 }
 
 function focusOf(info: WorldPayload['info'], dim: Dimension): { x: number, z: number } {
@@ -996,13 +1312,13 @@ function clampScale(scale: number, min: number): number {
 }
 
 function zoomLabel(scale: number): string {
-  if (scale >= 10) return `${Math.round(scale)} px`
+  if (scale >= 10) return `${Math.round(scale)} px/block`
   if (scale >= 1) {
     const rounded = Math.round(scale * 10) / 10
-    return Number.isInteger(rounded) ? `${rounded} px` : `${rounded.toFixed(1)} px`
+    return Number.isInteger(rounded) ? `${rounded} px/block` : `${rounded.toFixed(1)} px/block`
   }
-  if (scale >= 0.1) return `${scale.toFixed(2)} px`
-  return `${scale.toFixed(3)} px`
+  if (scale >= 0.1) return `${scale.toFixed(2)} px/block`
+  return `${scale.toFixed(3)} px/block`
 }
 
 function saveDetail(save: SaveListing): string {
@@ -1095,31 +1411,6 @@ function viewHasChunks(
   return false
 }
 
-function countVisible(
-  canvas: HTMLCanvasElement,
-  view: { originX: number, originZ: number, scale: number },
-  masks: Map<string, Uint8Array>
-): number {
-  const bounds = viewChunkBounds(canvas, view)
-  let count = 0
-  for (let rz = bounds.r0z; rz <= bounds.r1z; rz++) {
-    for (let rx = bounds.r0x; rx <= bounds.r1x; rx++) {
-      const present = masks.get(`${rx},${rz}`)
-      if (!present) continue
-      const lx0 = Math.max(0, bounds.c0x - rx * 32)
-      const lx1 = Math.min(31, bounds.c1x - rx * 32)
-      const lz0 = Math.max(0, bounds.c0z - rz * 32)
-      const lz1 = Math.min(31, bounds.c1z - rz * 32)
-      for (let lz = lz0; lz <= lz1; lz++) {
-        for (let lx = lx0; lx <= lx1; lx++) {
-          if (bitSet(present, (lz << 5) | lx)) count++
-        }
-      }
-    }
-  }
-  return count
-}
-
 function viewChunkBounds(canvas: HTMLCanvasElement, view: { originX: number, originZ: number, scale: number }) {
   const maxX = view.originX + canvas.clientWidth / view.scale
   const maxZ = view.originZ + canvas.clientHeight / view.scale
@@ -1188,82 +1479,111 @@ function exploredSpan(list: { rx: number, rz: number, present: Uint8Array }[]): 
   return { w: (maxCX - minCX + 1) * 16, h: (maxCZ - minCZ + 1) * 16 }
 }
 
-function occupiedInView(
-  canvas: HTMLCanvasElement,
-  view: { originX: number, originZ: number, scale: number },
-  masks: Map<string, Uint8Array>
-): { cx: number, cz: number }[] {
-  const bounds = viewChunkBounds(canvas, view)
-  const chunks: { cx: number, cz: number }[] = []
-  for (let rz = bounds.r0z; rz <= bounds.r1z; rz++) {
-    for (let rx = bounds.r0x; rx <= bounds.r1x; rx++) {
-      const present = masks.get(`${rx},${rz}`)
-      if (!present) continue
-      const lx0 = Math.max(0, bounds.c0x - rx * 32)
-      const lx1 = Math.min(31, bounds.c1x - rx * 32)
-      const lz0 = Math.max(0, bounds.c0z - rz * 32)
-      const lz1 = Math.min(31, bounds.c1z - rz * 32)
-      for (let lz = lz0; lz <= lz1; lz++) {
-        for (let lx = lx0; lx <= lx1; lx++) {
-          if (bitSet(present, (lz << 5) | lx)) chunks.push({ cx: rx * 32 + lx, cz: rz * 32 + lz })
-        }
-      }
-    }
-  }
-  return chunks
+interface OverviewCell {
+  dim: string
+  cx: number
+  cz: number
+  stride: number
+  rgb: [number, number, number]
 }
 
-function drawTerrain(
+interface StampBuf { w: number, h: number, data: Uint32Array, stamp: number }
+
+function overviewKey(dim: string, cx: number, cz: number, stride: number): string {
+  return `${dim}:${cx},${cz}:${stride}`
+}
+
+function drawChunkList(
   ctx: CanvasRenderingContext2D,
   cssW: number,
   cssH: number,
   originX: number,
   originZ: number,
   scale: number,
-  masks: Map<string, Uint8Array>,
+  chunks: { cx: number, cz: number }[],
   tiles: Map<string, HTMLCanvasElement>,
   dim: string
 ) {
-  if (masks.size === 0) return
-  const maxX = originX + cssW / scale
-  const maxZ = originZ + cssH / scale
-  const c0x = Math.floor(originX / 16)
-  const c1x = Math.floor(maxX / 16)
-  const c0z = Math.floor(originZ / 16)
-  const c1z = Math.floor(maxZ / 16)
-  const r0x = Math.floor(c0x / 32)
-  const r1x = Math.floor(c1x / 32)
-  const r0z = Math.floor(c0z / 32)
-  const r1z = Math.floor(c1z / 32)
   const chunkPx = 16 * scale
   ctx.imageSmoothingEnabled = false
-  for (let rz = r0z; rz <= r1z; rz++) {
-    for (let rx = r0x; rx <= r1x; rx++) {
-      const present = masks.get(`${rx},${rz}`)
-      if (!present) continue
-      const lx0 = Math.max(0, c0x - rx * 32)
-      const lx1 = Math.min(31, c1x - rx * 32)
-      const lz0 = Math.max(0, c0z - rz * 32)
-      const lz1 = Math.min(31, c1z - rz * 32)
-      for (let lz = lz0; lz <= lz1; lz++) {
-        for (let lx = lx0; lx <= lx1; lx++) {
-          if (!bitSet(present, (lz << 5) | lx)) continue
-          const cx = rx * 32 + lx
-          const cz = rz * 32 + lz
-          const sx = (cx * 16 - originX) * scale
-          const sz = (cz * 16 - originZ) * scale
-          const tile = tiles.get(tileKey(dim, cx, cz))
-          if (!tile) {
-            ctx.fillStyle = '#24382f'
-            ctx.fillRect(sx, sz, chunkPx, chunkPx)
-            continue
-          }
-          ctx.imageSmoothingEnabled = false
-          ctx.drawImage(tile, sx, sz, chunkPx, chunkPx)
-        }
-      }
+  for (const chunk of chunks) {
+    const sx = (chunk.cx * 16 - originX) * scale
+    const sz = (chunk.cz * 16 - originZ) * scale
+    if (sx + chunkPx < 0 || sz + chunkPx < 0 || sx > cssW || sz > cssH) continue
+    const tile = tiles.get(tileKey(dim, chunk.cx, chunk.cz))
+    if (!tile) {
+      ctx.fillStyle = '#24382f'
+      ctx.fillRect(sx, sz, chunkPx, chunkPx)
+      continue
     }
+    ctx.drawImage(tile, sx, sz, chunkPx, chunkPx)
   }
+}
+
+function drawOverview(
+  ctx: CanvasRenderingContext2D,
+  cssW: number,
+  cssH: number,
+  originX: number,
+  originZ: number,
+  scale: number,
+  dim: string,
+  cells: Map<string, OverviewCell>,
+  stride: number
+) {
+  const size = stride * 16 * scale
+  for (const cell of cells.values()) {
+    if (cell.dim !== dim || cell.stride !== stride) continue
+    const sx = (cell.cx * 16 - originX) * scale
+    const sz = (cell.cz * 16 - originZ) * scale
+    if (sx + size < 0 || sz + size < 0 || sx > cssW || sz > cssH) continue
+    ctx.fillStyle = `rgb(${cell.rgb[0]}, ${cell.rgb[1]}, ${cell.rgb[2]})`
+    ctx.fillRect(sx, sz, Math.max(size, 1), Math.max(size, 1))
+  }
+}
+
+function drawPreview(
+  ctx: CanvasRenderingContext2D,
+  cssW: number,
+  cssH: number,
+  originX: number,
+  originZ: number,
+  scale: number,
+  cells: { x: number, z: number, name: string }[],
+  buf: StampBuf
+) {
+  if (cells.length === 0) return
+  if (buf.w !== cssW || buf.h !== cssH) {
+    buf.w = cssW
+    buf.h = cssH
+    buf.data = new Uint32Array(cssW * cssH)
+    buf.stamp = 1
+  }
+  let stamp = buf.stamp + 1
+  if (stamp >= 0xffffffff) {
+    buf.data.fill(0)
+    stamp = 1
+  }
+  buf.stamp = stamp
+  const mark = scale < 2
+  ctx.globalAlpha = 0.72
+  for (const cell of cells) {
+    const sx = (cell.x - originX) * scale
+    const sz = (cell.z - originZ) * scale
+    const size = Math.max(scale, 1)
+    if (sx + size < 0 || sz + size < 0 || sx > cssW || sz > cssH) continue
+    if (mark) {
+      const px = sx | 0
+      const py = sz | 0
+      if (px < 0 || py < 0 || px >= cssW || py >= cssH) continue
+      const i = py * cssW + px
+      if (buf.data[i] === stamp) continue
+      buf.data[i] = stamp
+    }
+    ctx.fillStyle = COLORS[cell.name] || '#d7a15e'
+    ctx.fillRect(sx, sz, size, size)
+  }
+  ctx.globalAlpha = 1
 }
 
 function strokeGrid(

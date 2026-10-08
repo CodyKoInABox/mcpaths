@@ -16,9 +16,11 @@ import {
   describeState,
   loadChunkTag,
   newColumn,
+  profileOf,
   saveColumn
 } from './codec'
-import { isAir, isProtectedName } from './blocks'
+import { groundColumn, markProtectedColumns } from './columnscan'
+import { isAir } from './blocks'
 import { registry } from './codec'
 import { regionOf } from './grid'
 import {
@@ -70,6 +72,8 @@ interface EditableChunk {
   fresh: boolean
   touched: Set<number>
   protected: Set<string> | null
+  /** Column key `(lz << 4) | lx` → ground, including an explicit miss. */
+  grounds: Map<number, { y: number, name: string } | null> | null
   blockEntities: any[]
   entities: any[]
 }
@@ -258,7 +262,10 @@ export class World {
   private regions = new Map<string, any>()
   private chunks = new Map<string, EditableChunk>()
   private surfaces = new Map<string, Uint8Array>()
+  /** 3-byte overview color, separate from the full 16×16 tile. */
+  private colors = new Map<string, Uint8Array>()
   private failures = new Map<string, string>()
+  private masks = new Map<Dimension, Map<string, Buffer>>()
 
   private constructor(info: WorldInfo) {
     this.info = info
@@ -281,11 +288,14 @@ export class World {
     this.regions.clear()
     this.chunks.clear()
     this.surfaces.clear()
+    this.colors.clear()
     this.failures.clear()
+    this.masks.clear()
   }
 
   clearMapCache() {
     this.surfaces.clear()
+    this.colors.clear()
     this.failures.clear()
   }
 
@@ -301,6 +311,42 @@ export class World {
     this.surfaces.set(chunkKey(dim, cx, cz), rgb)
   }
 
+  cachedColor(dim: Dimension, cx: number, cz: number): Uint8Array | null {
+    return this.colors.get(chunkKey(dim, cx, cz)) ?? null
+  }
+
+  cacheColor(dim: Dimension, cx: number, cz: number, rgb: Uint8Array) {
+    this.colors.set(chunkKey(dim, cx, cz), rgb.length === 3 ? rgb : rgb.slice(0, 3))
+  }
+
+  /** Drop a clean column after its map color is cached. Dirty edits stay. */
+  releaseColumn(dim: Dimension, cx: number, cz: number) {
+    const key = chunkKey(dim, cx, cz)
+    const chunk = this.chunks.get(key)
+    if (!chunk || chunk.dirty) return
+    this.chunks.delete(key)
+  }
+
+  blockName(dim: Dimension, x: number, y: number, z: number): string {
+    const { cx, cz, lx, lz } = splitBlock(x, z)
+    const chunk = this.chunks.get(chunkKey(dim, cx, cz))
+    if (!chunk) return 'air'
+    return profileOf(chunk.column.getBlockStateId({ x: lx, y, z: lz })).name
+  }
+
+  /** Cached ground for path planning. Same result as walking the column from the top. */
+  groundBlock(dim: Dimension, x: number, z: number): { y: number, name: string } | null {
+    const { cx, cz, lx, lz } = splitBlock(x, z)
+    const chunk = this.chunks.get(chunkKey(dim, cx, cz))
+    if (!chunk) return null
+    if (!chunk.grounds) chunk.grounds = new Map()
+    const col = (lz << 4) | lx
+    if (chunk.grounds.has(col)) return chunk.grounds.get(col) ?? null
+    const found = groundColumn(chunk.column, lx, lz, dimensionBounds(dim))
+    chunk.grounds.set(col, found)
+    return found
+  }
+
   chunkError(dim: Dimension, cx: number, cz: number): string | null {
     return this.failures.get(chunkKey(dim, cx, cz)) ?? null
   }
@@ -309,21 +355,44 @@ export class World {
     let lastFile = ''
     for (const chunk of chunks) {
       if (hooks?.cancelled?.()) return
+      const key = chunkKey(dim, chunk.cx, chunk.cz)
+      if (this.chunks.has(key)) continue
+      if (!this.chunkOnDisk(dim, chunk.cx, chunk.cz)) continue
       const { rx, rz } = regionOf(chunk.cx, chunk.cz)
       const label = `r.${rx}.${rz}.mca`
       const file = path.join(this.regionDir(dim), label)
-      if (label !== lastFile && fs.existsSync(file)) {
+      if (label !== lastFile) {
         hooks?.progress?.(`Reading region ${label}…`)
         lastFile = label
       }
       try {
         await this.loadChunk(dim, chunk.cx, chunk.cz, false)
-        this.failures.delete(chunkKey(dim, chunk.cx, chunk.cz))
+        this.failures.delete(key)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        this.failures.set(chunkKey(dim, chunk.cx, chunk.cz), message)
+        this.failures.set(key, message)
       }
     }
+  }
+
+  private maskIndex(dim: Dimension): Map<string, Buffer> {
+    let index = this.masks.get(dim)
+    if (!index) {
+      index = new Map()
+      for (const mask of regionMasks(this.info.path, dim, this.info.dataVersion)) {
+        index.set(`${mask.rx},${mask.rz}`, mask.present)
+      }
+      this.masks.set(dim, index)
+    }
+    return index
+  }
+
+  private chunkOnDisk(dim: Dimension, cx: number, cz: number): boolean {
+    const located = regionOf(cx, cz)
+    const present = this.maskIndex(dim).get(`${located.rx},${located.rz}`)
+    if (!present) return false
+    const i = (located.lz << 5) | located.lx
+    return (present[i >> 3] & (1 << (i & 7))) !== 0
   }
 
   private async region(file: string) {
@@ -373,6 +442,7 @@ export class World {
       fresh,
       touched: new Set<number>(),
       protected: null,
+      grounds: null,
       blockEntities: [],
       entities: []
     }
@@ -446,7 +516,10 @@ export class World {
     chunk.column.setBlock({ x: lx, y, z: lz }, { stateId })
     chunk.dirty = true
     chunk.touched.add(Math.floor(y / 16))
-    this.surfaces.delete(chunkKey(dim, cx, cz))
+    chunk.grounds = null
+    const key = chunkKey(dim, cx, cz)
+    this.surfaces.delete(key)
+    this.colors.delete(key)
   }
 
   setBiome(dim: Dimension, x: number, y: number, z: number, biome: string) {
@@ -475,26 +548,13 @@ export class World {
 
   private scanProtected(dim: Dimension, chunk: EditableChunk): Set<string> {
     const found = new Set<string>()
-    const { minY, maxY } = dimensionBounds(dim)
     for (const entity of chunk.tag ? chunkBlockEntities(chunk.tag) : []) {
       if (Math.floor(entity.x / 16) !== chunk.chunkX || Math.floor(entity.z / 16) !== chunk.chunkZ) continue
       const lx = entity.x - chunk.chunkX * 16
       const lz = entity.z - chunk.chunkZ * 16
       found.add(`${lx},${lz}`)
     }
-    for (let lz = 0; lz < 16; lz++) {
-      for (let lx = 0; lx < 16; lx++) {
-        if (found.has(`${lx},${lz}`)) continue
-        for (let y = maxY; y >= minY; y--) {
-          const block = chunk.column.getBlock({ x: lx, y, z: lz })
-          const name = block?.name || ''
-          if (name !== 'bedrock' && isProtectedName(name)) {
-            found.add(`${lx},${lz}`)
-            break
-          }
-        }
-      }
-    }
+    markProtectedColumns(chunk.column, found, dimensionBounds(dim))
     return found
   }
 
@@ -529,6 +589,7 @@ export class World {
   async save(): Promise<{ backupDir: string | null, chunks: number, files: string[] }> {
     const dirty = [...this.chunks.values()].filter(chunk => chunk.dirty)
     if (dirty.length === 0) return { backupDir: null, chunks: 0, files: [] }
+    const created = dirty.some(chunk => chunk.fresh)
     const files = [...new Set(dirty.map(chunk => chunk.file).filter(file => fs.existsSync(file)))]
     const backupDir = await backupRegionFiles(this.info.path, files)
     for (const chunk of dirty) {
@@ -555,6 +616,7 @@ export class World {
       chunk.entities = []
       chunk.protected = null
     }
+    if (created) this.masks.clear()
     return { backupDir, chunks: dirty.length, files }
   }
 }

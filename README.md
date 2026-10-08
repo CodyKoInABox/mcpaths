@@ -35,7 +35,7 @@ Trail, Cobble road, Moss walk, Sandstone way, Adaptive, Boardwalk.
 
 Options: width Narrow 3 / Normal 5 / Wide 7, hills Follow or Tunnel, water Bridge or Causeway, dressing Off / Subtle / Lined.
 
-The default is Trail, Normal, Follow, Bridge, Subtle. Several named paths can be drawn in one session. Preview is drawn on the map before Apply.
+The default is Trail, Normal, Follow, Bridge, Subtle. Several named paths can be drawn in one session, kept per dimension. Preview is drawn on the map before Apply. Adaptive uses the biome under the first point only. Tunnel skips water and ignores the water and dressing settings. Sandstone way has no plants or posts.
 
 ## Dev
 
@@ -55,3 +55,6 @@ License: GPL-3.0-only.
 - Entity region files (`entities/*.mca`) are not edited. Entities stored inside the terrain chunk are preserved.
 - A brand-new chunk is serialized through prismarine, so unknown extra chunk fields are not invented. Existing chunks only replace `block_states` on touched sections, heightmaps, and the light flags.
 - The Windows installer is not code-signed.
+- Adaptive uses the biome at the first point only. It does not change materials along the path.
+- Tunnel does not cross water. Bridge, causeway, and dressing apply only while hills is Follow.
+- Far zoom is an overview until the view holds 128 chunks or fewer.

@@ -7,6 +7,7 @@ const core = require(path.join(__dirname, '../../core/dist/index.js'))
 let win = null
 let world = null
 let mapToken = 0
+let previewToken = 0
 let worldChain = Promise.resolve()
 
 function enqueue(task) {
@@ -97,6 +98,7 @@ ipcMain.handle('pick-folder', async () => {
   const result = await dialog.showOpenDialog(win, { properties: ['openDirectory'] })
   if (result.canceled || !result.filePaths[0]) return { ok: true, data: null }
   mapToken++
+  previewToken++
   try {
     return { ok: true, data: await enqueue(() => openPath(result.filePaths[0])) }
   } catch (error) {
@@ -106,6 +108,7 @@ ipcMain.handle('pick-folder', async () => {
 
 ipcMain.handle('open-world', async (_event, folder) => {
   mapToken++
+  previewToken++
   try {
     return { ok: true, data: await enqueue(() => openPath(folder)) }
   } catch (error) {
@@ -183,7 +186,9 @@ ipcMain.handle('tiles', async (event, query) => {
         progress: message => {
           if (token === mapToken) event.sender.send('map-progress', message)
         },
-        cancelled: () => token !== mapToken
+        cancelled: () => token !== mapToken,
+        release: true,
+        quality: query.quality === 'color' ? 'color' : 'full'
       })
       if (token !== mapToken || map.aborted) return { ok: false, cancelled: true }
       return {
@@ -203,34 +208,31 @@ ipcMain.handle('tiles', async (event, query) => {
 })
 
 ipcMain.handle('preview', async (_event, query) => {
+  const token = ++previewToken
   if (!world) return { ok: false, error: 'No world is open.' }
   return enqueue(async () => {
-    if (!world) return { ok: false, error: 'No world is open.' }
+    if (!world || token !== previewToken) return { ok: false, cancelled: true }
     try {
-      let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity
-      for (const path of query.paths) {
-        for (const point of path.points) {
-          minX = Math.min(minX, point.x)
-          minZ = Math.min(minZ, point.z)
-          maxX = Math.max(maxX, point.x)
-          maxZ = Math.max(maxZ, point.z)
-        }
-      }
-      if (Number.isFinite(minX)) await world.preload(query.dim, minX - 8, minZ - 8, maxX + 8, maxZ + 8)
-      const cells = core.previewPaths(world, query.dim, query.paths)
+      const cells = await core.previewPaths(world, query.dim, query.paths, {
+        cancelled: () => token !== previewToken
+      })
+      if (token !== previewToken) return { ok: false, cancelled: true }
       return { ok: true, data: cells.map(cell => ({ x: cell.x, y: cell.y, z: cell.z, name: cell.name })) }
     } catch (error) {
+      if (token !== previewToken) return { ok: false, cancelled: true }
       return { ok: false, error: error.message }
     }
   })
 })
 
-ipcMain.handle('apply', async (_event, query) => {
+ipcMain.handle('apply', async (event, query) => {
   if (!world) return { ok: false, error: 'No world is open.' }
   return enqueue(async () => {
     if (!world) return { ok: false, error: 'No world is open.' }
     try {
-      const result = await core.applyPaths(world, query.dim, query.paths)
+      const result = await core.applyPaths(world, query.dim, query.paths, {
+        progress: message => event.sender.send('map-progress', message)
+      })
       world.clearMapCache()
       return {
         ok: true,

@@ -1,43 +1,47 @@
 import { isProtectedName } from './blocks'
 import { dimensionBounds, type Dimension } from './versions'
-import type { World } from './world'
-import { planPaths, type ColumnView } from './path/generate'
+import type { LoadHooks, World } from './world'
+import { corridorChunks } from './path/cover'
+import { planPaths, type ColumnView, type Placement } from './path/generate'
 import type { NamedPath } from './path/presets'
 
-export async function applyPaths(world: World, dim: Dimension, paths: NamedPath[]) {
-  let minX = Infinity
-  let minZ = Infinity
-  let maxX = -Infinity
-  let maxZ = -Infinity
-  for (const path of paths) {
-    for (const point of path.points) {
-      minX = Math.min(minX, point.x)
-      minZ = Math.min(minZ, point.z)
-      maxX = Math.max(maxX, point.x)
-      maxZ = Math.max(maxZ, point.z)
-    }
-  }
-  if (!Number.isFinite(minX)) return world.save()
-  await world.preload(dim, minX - 8, minZ - 8, maxX + 8, maxZ + 8)
-  const view: ColumnView = {
-    get: (x, y, z) => world.getBlock(dim, x, y, z),
+async function preloadCorridor(world: World, dim: Dimension, paths: NamedPath[], hooks?: LoadHooks) {
+  const chunks = corridorChunks(paths)
+  if (chunks.length === 0) return chunks
+  await world.preloadChunks(dim, chunks, hooks)
+  return chunks
+}
+
+function columnView(world: World, dim: Dimension): ColumnView {
+  return {
+    get: (x, y, z) => ({ name: world.blockName(dim, x, y, z) }),
     biome: (x, y, z) => world.getBiome(dim, x, y, z),
-    protected: (x, z) => world.isProtectedColumn(dim, x, z)
+    protected: (x, z) => world.isProtectedColumn(dim, x, z),
+    ground: (x, z) => world.groundBlock(dim, x, z)
   }
-  const placements = planPaths(view, paths, dimensionBounds(dim))
+}
+
+export async function applyPaths(world: World, dim: Dimension, paths: NamedPath[], hooks?: LoadHooks) {
+  if (!paths.some(path => path.points.length >= 2)) return world.save()
+  hooks?.progress?.('Reading terrain…')
+  await preloadCorridor(world, dim, paths, hooks)
+  if (hooks?.cancelled?.()) return world.save()
+  hooks?.progress?.('Placing blocks…')
+  const placements = await planPaths(columnView(world, dim), paths, dimensionBounds(dim))
   for (const placement of placements) {
-    const existing = world.getBlock(dim, placement.x, placement.y, placement.z)
-    if (existing.name === 'bedrock' || (existing.name !== 'air' && isProtectedName(existing.name))) continue
+    const name = world.blockName(dim, placement.x, placement.y, placement.z)
+    if (name === 'bedrock' || (name !== 'air' && isProtectedName(name))) continue
     world.setBlock(dim, placement.x, placement.y, placement.z, placement.name, placement.properties)
   }
+  hooks?.progress?.('Saving regions…')
   return world.save()
 }
 
-export function previewPaths(world: World, dim: Dimension, paths: NamedPath[]) {
-  const view: ColumnView = {
-    get: (x, y, z) => world.getBlock(dim, x, y, z),
-    biome: (x, y, z) => world.getBiome(dim, x, y, z),
-    protected: (x, z) => world.isProtectedColumn(dim, x, z)
-  }
-  return planPaths(view, paths, dimensionBounds(dim))
+export async function previewPaths(world: World, dim: Dimension, paths: NamedPath[], hooks?: LoadHooks): Promise<Placement[]> {
+  const chunks = await preloadCorridor(world, dim, paths, hooks)
+  let cells: Placement[] = []
+  if (!hooks?.cancelled?.()) cells = await planPaths(columnView(world, dim), paths, dimensionBounds(dim), hooks?.cancelled)
+  for (const chunk of chunks ?? []) world.releaseColumn(dim, chunk.cx, chunk.cz)
+  if (hooks?.cancelled?.()) return []
+  return cells
 }

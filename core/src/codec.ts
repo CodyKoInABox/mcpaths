@@ -1,6 +1,6 @@
 import nbt from 'prismarine-nbt'
 import { CODEC_VERSION, type PaletteSchema } from './versions'
-import { bareName, namespaced } from './blocks'
+import { bareName, isAir, isHeadroom, isLeaves, isLog, isProtectedName, isWater, namespaced } from './blocks'
 import { extendRegistry, mergeProperties, type BlockOcc } from './registry'
 import { readPalette, retagPalette, sectionList, type PaletteEntry } from './palette'
 import { updateHeightmaps } from './heightmap'
@@ -14,8 +14,22 @@ const Block = BlockFactory(registry)
 const codec = ChunkCodec(CODEC_VERSION)
 const extra = extendRegistry(registry)
 
+const placedState = new Map<string, number>()
+
+function placementKey(name: string, properties: Record<string, string>): string {
+  const keys = Object.keys(properties)
+  if (keys.length === 0) return name
+  keys.sort()
+  let key = name
+  for (const prop of keys) key += '\0' + prop + '=' + properties[prop]
+  return key
+}
+
 export function blockStateId(name: string, properties: Record<string, string> = {}): number {
   const bare = bareName(name)
+  const key = placementKey(bare, properties)
+  const cached = placedState.get(key)
+  if (cached != null) return cached
   if (!registry.blocksByName[bare]) {
     extra.ensureBlocks([{ name: bare, properties }])
   }
@@ -24,7 +38,48 @@ export function blockStateId(name: string, properties: Record<string, string> = 
   if (!block || block.stateId == null) {
     throw new Error(`MC Paths does not know how to place ${namespaced(bare)}.`)
   }
+  placedState.set(key, block.stateId)
   return block.stateId
+}
+
+export interface StateProfile {
+  name: string
+  air: boolean
+  water: boolean
+  headroom: boolean
+  leaves: boolean
+  log: boolean
+  solid: boolean
+  protected: boolean
+  /** Air, plants, leaves, and logs. The path looks through these for the ground. */
+  groundSkip: boolean
+}
+
+const stateProfiles = new Map<number, StateProfile>()
+
+/** One Block allocation per state id. Hot loops must not call getBlock. */
+export function profileOf(stateId: number): StateProfile {
+  const cached = stateProfiles.get(stateId)
+  if (cached) return cached
+  const block = Block.fromStateId(stateId, 0)
+  const name = block?.name || 'air'
+  const air = isAir(name)
+  const leaves = isLeaves(name)
+  const log = isLog(name)
+  const headroom = isHeadroom(name)
+  const profile: StateProfile = {
+    name,
+    air,
+    water: isWater(name),
+    headroom,
+    leaves,
+    log,
+    solid: block?.boundingBox === 'block',
+    protected: name !== 'bedrock' && isProtectedName(name),
+    groundSkip: air || headroom || leaves || log
+  }
+  stateProfiles.set(stateId, profile)
+  return profile
 }
 
 export function describeState(stateId: number): { name: string, properties: Record<string, string> } {
@@ -132,7 +187,7 @@ export function chunkTagFromColumn(column: any, chunkX: number, chunkZ: number, 
     delete section.BlockLight
     delete section.SkyLight
   }
-  updateHeightmaps(tag, column)
+  updateHeightmaps(tag, column, profileOf)
   return tag
 }
 
@@ -174,7 +229,7 @@ export function saveColumn(tag: any, column: any, dataVersion: number, schema: P
   }
   tag.value.DataVersion = nbt.int(dataVersion)
   tag.value.isLightOn = nbt.byte(0)
-  updateHeightmaps(tag, column)
+  updateHeightmaps(tag, column, profileOf)
   return tag
 }
 

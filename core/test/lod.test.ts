@@ -4,10 +4,12 @@ import { DATA_VERSION_26_2 } from '../src/versions'
 import {
   CHUNK_TILE,
   CHUNK_TILE_BYTES,
+  DETAIL_CHUNK_CAP,
   farPixelsPerBlock,
   MIN_PIXELS_PER_BLOCK,
   sampleTiles,
   sliderToZoom,
+  viewStride,
   zoomToSlider
 } from '../src'
 import { buildFixture } from './fixture'
@@ -42,6 +44,27 @@ function uniqueColors(rgb: Uint8Array): number {
   for (let i = 0; i < rgb.length; i += 3) seen.add(`${rgb[i]},${rgb[i + 1]},${rgb[i + 2]}`)
   return seen.size
 }
+
+test('overview stride stays near a few hundred samples', () => {
+  assert.equal(viewStride(1), 1)
+  assert.equal(viewStride(DETAIL_CHUNK_CAP), 1)
+  assert.ok(viewStride(DETAIL_CHUNK_CAP + 1) >= 2)
+  const stride = viewStride(40000)
+  assert.ok(stride >= 2)
+  assert.ok(Math.ceil(40000 / (stride * stride)) < 800)
+})
+
+test('color tiles are 3 bytes and release the decoded column', async () => {
+  const { world } = await buildFixture(DATA_VERSION_26_2)
+  const color = await sampleTiles(world, 'overworld', [{ cx: 0, cz: 0 }], { quality: 'color', release: true })
+  assert.equal(color.aborted, false)
+  assert.equal(color.rgb.length, 3)
+  assert.ok(color.rgb.some(byte => byte > 40))
+  assert.equal(world.columnOf('overworld', 0, 0), null)
+  const again = await sampleTiles(world, 'overworld', [{ cx: 0, cz: 0 }], { quality: 'color', release: true })
+  assert.deepEqual(again.rgb, color.rgb)
+  await world.close()
+})
 
 test('chunk tiles are one color per block and stay cached', async () => {
   const { world } = await buildFixture(DATA_VERSION_26_2)

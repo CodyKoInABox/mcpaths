@@ -104,7 +104,7 @@ export interface McPathsApi {
   bounds: (dim: Dimension) => Promise<ApiResult<{ minX: number, minZ: number, maxX: number, maxZ: number } | null>>
   regions: (dim: Dimension) => Promise<ApiResult<RegionMask[]>>
   sample: (query: { dim: Dimension, originX: number, originZ: number, width: number, height: number, force?: boolean }) => Promise<ApiResult<MapResult>>
-  tiles: (query: { dim: Dimension, chunks: { cx: number, cz: number }[], force?: boolean }) => Promise<ApiResult<TileResult>>
+  tiles: (query: { dim: Dimension, chunks: { cx: number, cz: number }[], force?: boolean, quality?: 'full' | 'color' }) => Promise<ApiResult<TileResult>>
   preview: (query: { dim: Dimension, paths: { name: string, points: XZ[], preset: PresetId, options: PathOptions }[] }) => Promise<ApiResult<{ x: number, z: number, name: string }[]>>
   apply: (query: { dim: Dimension, paths: { name: string, points: XZ[], preset: PresetId, options: PathOptions }[] }) => Promise<ApiResult<{ backupDir: string | null, chunks: number }>>
   onOpened: (handler: (payload: WorldPayload) => void) => () => void

@@ -18,7 +18,10 @@ export {
   farPixelsPerBlock,
   zoomToSlider,
   sliderToZoom,
+  viewStride,
   DETAIL_CHUNK_BUDGET,
+  DETAIL_CHUNK_CAP,
+  OVERVIEW_BUDGET,
   MIN_PIXELS_PER_BLOCK,
   MAX_PIXELS_PER_BLOCK
 } from './lod'
@@ -29,6 +32,7 @@ export type { GridAddress } from './grid'
 export { levelDisplayName, nbtNumber, playerFromLevel, gameTypeFromLevel, lastPlayedFromLevel } from './names'
 export type { GameTypeName, PlayerView } from './names'
 export { applyPaths, previewPaths } from './apply'
+export { corridorChunks } from './path/cover'
 export { planPaths } from './path/generate'
 export type { Placement } from './path/generate'
 export {
